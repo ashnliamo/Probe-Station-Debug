@@ -14,29 +14,21 @@ Each INPUT pad on the chip is wired through a resistor of a known, unique value
 to a shared central node, which is then wired to all the output pads. The
 resistor values are chosen as a binary ladder: 1x, 2x, 4x, 8x, and so on. When
 you land the whole probe card and measure the resistance from the inputs to the
-output, you are reading all the input resistors in parallel. Because the values
-are binary, the single parallel number tells you exactly which probes are
+output, you are reading all the input resistors in parallel. The single parallel number tells you exactly which probes are
 touching and which are open.
 
 ONE-TIME SETUP
 
-Install Python 3, version 3.10 or newer. On Mac or Linux use python3 instead
-of py.
+Install Python 3, version 3.10 or newer.
+Install the one dependency, gdstk.
 
-Install the one dependency, gdstk:
-
-```
-py -m pip install gdstk
-```
 
 FOLDERS
 
-```
 inputs/         your pinout CSV goes here      -- input to script 1
 outputs/        script 1 writes results here
 decode_inputs/  the CSV the decoder reads      -- input to script 2
 tests/          self-checks, optional
-```
 
 ============================================================================
 SCRIPT 1 -- GENERATE THE MASKS   io_pair_wiring_parallel.py
@@ -49,34 +41,22 @@ Put your probe-card pinout in the inputs folder. Any single .csv name works.
 Append a column named "I/O" after the Net Class column. Column names are
 case-insensitive and extra columns are ignored. Tag each pad:
 
-```
 INPUTn     this pad is an input  in group n
 OUTPUTn    this pad is an output in group n
-```
 
 Pads that share the same number n form one group: every INPUTn is wired through
 its own resistor to the OUTPUTn pads. A group needs at least one INPUT and one
 OUTPUT or it is dropped.
 
-STEP 1B:  Run it
-
+STEP 1B:  Run the program
 
 It will ask how many metal layers per chip:
 
-```
 1 = one IO group per chip    -- single metal layer, no vias
 2 = two IO groups per chip   -- second group on metal 2, via-stitched
-```
-
-To skip the question, pass it on the command line:
-
-```
-py io_pair_wiring_parallel.py --layers 2
-```
 
 STEP 1C:  What you get, in outputs/
 
-```
 outputs/
   <pinout>_parallel.csv         the decode key
 
@@ -92,14 +72,12 @@ outputs/
                                 same ladder values, for measuring real sheet
                                 resistance
     calibration_resistors.csv   the theoretical values for that coupon
-```
 
 The console also prints the die size, the resistor-per-edge protrusion, and
 how many chips were made.
 
 STEP 1D:  Columns in the key CSV
 
-```
 chip                  which chip and GDS this resistor is on
 layer                 which metal layer, 1 or 2
 input_pad             the input pad name, the probe you are testing
@@ -108,7 +86,6 @@ output_pads           the shared output pads for the group
 actual_R_ohm          the resistor's real resistance
 total_len_um          length of the resistor trace, microns
 group_parallel_R_ohm  resistance with every probe in the group landed
-```
 
 ============================================================================
 SCRIPT 2 -- DECODE A MEASUREMENT   find_missing_probes.py
@@ -140,7 +117,6 @@ It will:
      margin telling how accurate your reading must be to be sure. It warns you
      if the answer is ambiguous or the reading looks wrong.
 
-
 STEP 2D:  Calibration
 
 The real fabricated resistors are never exactly the calculated values because
@@ -163,10 +139,8 @@ TUNING
 
 The design knobs live at the top of io_pair_wiring_parallel.py:
 
-```
 PAD_SIZE            pad size in microns
 WIRE_WIDTH          resistor trace width
 COIL_GAP            gap from the pad to the start of its resistor
 COIL_BASE_R         resistance of the smallest resistor in a group
 MAX_BINARY_INPUTS   groups bigger than this are split across more chips
-```
