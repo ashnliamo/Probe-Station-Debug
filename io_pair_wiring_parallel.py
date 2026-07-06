@@ -678,17 +678,19 @@ def build_calibration(resistances):
         cell.add(gdstk.FlexPath(pts, WIRE_WIDTH, layer=L, datatype=METAL_DT))
         cell.add(rect(cx - CALIB_PAD / 2.0, pad_bot, cx + CALIB_PAD / 2.0, pad_top, L))
 
-        length = polyline_len(pts)
-        squares = length / WIRE_WIDTH
-        theo_r = SHEET_RES * squares                # == b["R"] after the solve
+        length = polyline_len(pts)                  # physical trace length
+        # Accurate resistance: the whole path (bus stub + meander + L to the pad) with
+        # the bend correction, so the many right-angle corners are not over-counted.
+        squares = resistive_length(pts, []) / WIRE_WIDTH
+        actual_r = SHEET_RES * squares
         if ADD_LABELS:
-            cell.add(*gdstk.text(f"{theo_r:.0f} ohm", CALIB_LABEL,
+            cell.add(*gdstk.text(f"{actual_r:.0f} ohm", CALIB_LABEL,
                                  (cx - CALIB_PAD / 2.0, pad_bot - CALIB_LABEL - 15),
                                  layer=LABEL_LAYER, datatype=LABEL_DT))
             cell.add(*gdstk.text(f"{length:.0f} um", CALIB_LABEL * 0.7,
                                  (cx - CALIB_PAD / 2.0, pad_bot - 2 * CALIB_LABEL - 30),
                                  layer=LABEL_LAYER, datatype=IO_LABEL_DT))
-        rows.append([f"{b['R']:.0f}", f"{theo_r:.1f}", f"{squares:.1f}", f"{length:.0f}"])
+        rows.append([f"{b['R']:.0f}", f"{actual_r:.1f}", f"{squares:.1f}", f"{length:.0f}"])
         x += cw + CALIB_GAP
     if ADD_DIE_OUTLINE:                          # bottom layer, built LAST
         cell.add(gdstk.rectangle((0.0, 0.0), (die_w, -die_h),
@@ -935,16 +937,16 @@ def main():
               f"{DIE_H/1000:.0f} mm die -- lower MAX_BINARY_INPUTS.")
     matched = [g["num"] for g in groups]
     wired_in = sum(len(g["inputs"]) for g in groups)
-    print(f"Matched group number(s) {matched}: {len(groups)} group(s), "
-          f"{wired_in} input(s) wired (unmatched numbers dropped).")
+    print(f"Matched group numbers {matched}: {len(groups)} groups, "
+          f"{wired_in} inputs wired (unmatched numbers dropped).")
     if len(coupons) > len(groups):
         print(f"  Split into {len(coupons)} layers "
               f"(<= {MAX_BINARY_INPUTS} inputs per layer).")
     for g in groups:
         nsub = sum(1 for c in coupons if c["num"] == g["num"])
         extra = f" -> {nsub} layers total" if nsub > 1 else ""
-        print(f"  group {g['num']}: {len(g['inputs'])} input(s), "
-              f"{len(g['outputs'])} output(s){extra}")
+        print(f"  group {g['num']}: {len(g['inputs'])} inputs, "
+              f"{len(g['outputs'])} outputs{extra}")
 
     xs = [p["x"] for p in pads]
     ys = [p["y"] for p in pads]
@@ -953,8 +955,8 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     chips = pack_chips(coupons, groups_per_chip)
-    print(f"{layers}-layer chips: up to {groups_per_chip} layer(s) per chip "
-          f"-> {len(chips)} chip(s).")
+    print(f"{layers}-layer chips: up to {groups_per_chip} layers per chip "
+          f"-> {len(chips)} chips.")
     # Name each GDS by its group(s); show the sub-index only for split groups.
     nsub = {}
     for c in coupons:
@@ -972,7 +974,7 @@ def main():
 
         shorts = find_shorts(geo, len(chip_coupons))
         if shorts:
-            print(f"  ! chip {ci} ({'_'.join(tags)}): {len(shorts)} cross-net overlap(s)")
+            print(f"  ! chip {ci} ({'_'.join(tags)}): {len(shorts)} cross-net overlaps")
 
     csv_out = safe_path(OUTPUT_DIR / f"{csv_path.stem}_parallel.csv")
     with open(csv_out, "w", newline="") as f:
@@ -981,7 +983,7 @@ def main():
                     "output_pads", "actual_R_ohm", "total_len_um",
                     "group_parallel_R_ohm"])
         w.writerows(all_rows)
-    print(f"Wrote {csv_out} ({len(all_rows)} coils across {len(chips)} chip(s)).")
+    # print(f"Wrote {csv_out} ({len(all_rows)} coils across {len(chips)} chips).")
 
     # Calibration coupon (resistances match the on-chip ladder).
     calib_res = [input_target_r(k) for k in range(1, CALIB_COUNT + 1)]
@@ -991,13 +993,13 @@ def main():
     calib_csv = safe_path(CALIB_DIR / "calibration_resistors.csv")
     with open(calib_csv, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["target_R_ohm", "theoretical_R_ohm", "squares", "trace_len_um"])
+        w.writerow(["target_R_ohm", "actual_R_ohm", "squares", "trace_len_um"])
         w.writerows(calib_rows)
     fit = "" if (cdw, cdh) == (DIE_W, DIE_H) else " (enlarged to fit its content)"
-    print(f"Wrote {calib_gds.name}: {cdw/1000:.1f}x{cdh/1000:.1f} mm die matching the "
-          f"test chips{fit}, COMMON pad + {len(calib_rows)} probe pads "
-          f"({', '.join(r[0] + ' ohm' for r in calib_rows)}); measure each vs COMMON, "
-          f"then actual sheet res = R_measured / squares.")
+    # print(f"Wrote {calib_gds.name}: {cdw/1000:.1f}x{cdh/1000:.1f} mm die matching the "
+    #       f"test chips{fit}, COMMON pad + {len(calib_rows)} probe pads "
+    #       f"({', '.join(r[0] + ' ohm' for r in calib_rows)}); measure each vs COMMON, "
+    #       f"then actual sheet res = R_measured / squares.")
 
 
 if __name__ == "__main__":

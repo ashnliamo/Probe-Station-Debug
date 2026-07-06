@@ -1,268 +1,172 @@
-**PROBE-CARD CONTACT-TEST MASK GENERATOR**
-
-
+PROBE-CARD CONTACT-TEST MASK GENERATOR
 
 This project has two scripts that work as a pair:
 
+  1. io_pair_wiring_parallel.py  -- GENERATES the GDS test-chip mask from a
+     pinout.
+  2. find_missing_probes.py      -- DECODES a parallel resistance reading from a
+     fabricated chip to tell you which probes on the probe card failed to make
+     contact.
 
+WHAT THE TEST CHIP DOES
 
-&#x20; 1. io\_pair\_wiring\_parallel.py   - GENERATES the test-chip mask (GDS) from a
+Each INPUT pad on the chip is wired through a resistor of a known, unique value
+to a shared central node, which is then wired to all the output pads. The
+resistor values are chosen as a binary ladder: 1x, 2x, 4x, 8x, and so on. When
+you land the whole probe card and measure the resistance from the inputs to the
+output, you are reading all the input resistors in parallel. Because the values
+are binary, the single parallel number tells you exactly which probes are
+touching and which are open.
 
-&#x20;                                   pinout.  
+ONE-TIME SETUP
 
-&#x20; 2. find\_missing\_probes.py       - DECODES a parallel resistance reading from a
+Install Python 3, version 3.10 or newer. On Mac or Linux use python3 instead
+of py.
 
-&#x20;                                   fabricated chip to tell you which probes
+Install the one dependency, gdstk:
 
-&#x20;                                   on the probe card failed to make contact.
+```
+py -m pip install gdstk
+```
 
+FOLDERS
 
-
-**WHAT THE TEST CHIP DOES**
-
-
-
-Each INPUT pad on the chip is wired through a resistor of a known, unique
-
-value to a shared central node, which is then wired to all the output pads.  
-
-The resistor values are chosen as a binary ladder (1x, 2x, 4x, 8x, ...).  
-
-When you land the whole probe card and measure the resistance from the input to output, you are
-
-reading all the input resistors in parallel.  Because the values are binary,
-
-the single parallel number tells you exactly which probes are touching and
-
-which are open.
-
-
-
-**ONE-TIME SETUP**
-
-
-
-Python 3 (3.10 or newer)
-
-
-
-One dependency, gdstk: py -m pip install gdstk
-
-
-
-**FOLDERS**
-
-
-
-&#x20;  inputs/          your pinout CSV goes here   (input to script #1)
-
-&#x20;  outputs/         script #1 writes the GDS + CSV here
-
-&#x20;  decode\_inputs/   the CSV the decoder reads   (input to script #2)
-
-&#x20;  tests/           self-checks (optional, see bottom)
-
-
-
-
+```
+inputs/         your pinout CSV goes here      -- input to script 1
+outputs/        script 1 writes results here
+decode_inputs/  the CSV the decoder reads      -- input to script 2
+tests/          self-checks, optional
+```
 
 ============================================================================
-
-&#x20;**SCRIPT 1 -- GENERATE THE MASKS  (io\_pair\_wiring\_parallel.py)**
-
+SCRIPT 1 -- GENERATE THE MASKS   io_pair_wiring_parallel.py
 ============================================================================
 
+STEP 1A:  Prepare the pinout CSV
 
+Put your probe-card pinout in the inputs folder. Any single .csv name works.
 
-**STEP 1A:  Prepare the pinout CSV**
+Append a column named "I/O" after the Net Class column. Column names are
+case-insensitive and extra columns are ignored. Tag each pad:
 
+```
+INPUTn     this pad is an input  in group n
+OUTPUTn    this pad is an output in group n
+```
 
+Pads that share the same number n form one group: every INPUTn is wired through
+its own resistor to the OUTPUTn pads. A group needs at least one INPUT and one
+OUTPUT or it is dropped.
 
-Put your probe-card pinout in the "inputs" folder
-
-
-
-Append a column after Net Class named "I/O" (names are case-insensitive,
-
-extra columns are ignored)                 
-
-
-
-&#x20;  INPUTn     this pad is an input  in group n   
-
-&#x20;  OUTPUTn    this pad is an output in group n   
-
-
-
-Pads that share the same number n form one "group": every INPUTn is wired
-
-through its own resistor to the OUTPUTn pads.  A group needs at least one
-
-INPUT and one OUTPUT or it is dropped.
-
-
-
-**STEP 1B:  Run it**
-
+STEP 1B:  Run it
 
 
 It will ask how many metal layers per chip:
 
+```
+1 = one IO group per chip    -- single metal layer, no vias
+2 = two IO groups per chip   -- second group on metal 2, via-stitched
+```
 
+To skip the question, pass it on the command line:
 
-&#x20;  1 = one IO group per chip   (single metal layer, no vias)
+```
+py io_pair_wiring_parallel.py --layers 2
+```
 
-&#x20;  2 = two IO groups per chip  (second group on metal 2, via-stitched)
+STEP 1C:  What you get, in outputs/
 
+```
+outputs/
+  <pinout>_parallel.csv         the decode key
 
+  gds/
+    groups_<n>.gds              one GDS per chip; the name lists its group or
+                                groups, e.g. groups_3.0_4.gds is group 3 part 0
+                                plus group 4
+  schematics/
+    schematic_<n>.svg           a circuit diagram per chip, one block per layer,
+                                showing every pad, resistor, and the output node
+  calibration/
+    calibration_resistors.gds   a coupon of big, easy-to-probe resistors at the
+                                same ladder values, for measuring real sheet
+                                resistance
+    calibration_resistors.csv   the theoretical values for that coupon
+```
 
-**STEP 1C:  What you get  (in outputs/)**
+The console also prints the die size, the resistor-per-edge protrusion, and
+how many chips were made.
 
+STEP 1D:  Columns in the key CSV
 
-
-&#x20;  groups\_<n>.gds              one GDS per chip
-
-&#x20;                              The filename lists the groups on that chip
-
-&#x20;                              (e.g. groups\_3.0\_4.gds = group 3 part 0 + group 4).
-
-
-
-&#x20;  pinout\_grouped\_parallel.csv every resistor's pad, signal,
-
-&#x20;                              outputs, and its ACTUAL resistance.  The
-
-&#x20;                              decoder needs this file (see Script 2).
-
-
-
-&#x20;  calibration\_resistors.gds   a separate coupon with a row of big, easy-to-
-
-&#x20;                              probe resistors at the same ladder values, used
-
-&#x20;                              to measure the real sheet resistance.
-
-
-
-&#x20;  calibration\_resistors.csv   the theoretical values for that coupon.
-
-
-
-The console also prints the die size, resistor-per-edge protrusion, how many
-
-chips were made.
-
-
-
-============================================================================
-
-&#x20;**SCRIPT 2 -- DECODE A MEASUREMENT  (find\_missing\_probes.py)**
+```
+chip                  which chip and GDS this resistor is on
+layer                 which metal layer, 1 or 2
+input_pad             the input pad name, the probe you are testing
+input_signal          its net name
+output_pads           the shared output pads for the group
+actual_R_ohm          the resistor's real resistance
+total_len_um          length of the resistor trace, microns
+group_parallel_R_ohm  resistance with every probe in the group landed
+```
 
 ============================================================================
+SCRIPT 2 -- DECODE A MEASUREMENT   find_missing_probes.py
+============================================================================
 
+STEP 2A:  Give the decoder the key file
 
+Copy the decode key the generator made into the decode_inputs folder. Any single
+.csv name works. If you are calibrating, also copy the calibration CSV into the
+same folder, see Step 2D. The decoder tells the two apart by their columns, so
+both can sit there at once.
 
-**STEP 2A:  Give the decoder the key file**
+STEP 2B:  Take the measurement on the bench
 
+Land the probe card on the chip you want to test. With the whole probe card
+landed, measure the group's parallel resistance from its inputs to its output.
+Note the chip number, the layer number, and that reading.
 
-
-Copy the csv file the generator (not calibration csv) into the "decode input" folder.
-
-
-
-**STEP 2B:  Take the measurement on the bench**
-
-
-
-Land the probe card on the chip you want to test. Measure 
-
-the resistance from the group's INPUT to OUTPUT.  Note the
-
-chip number, the layer number, and that resistance reading.
-
-
-
-**STEP 2C:  Run find\_missing\_probes.py**
-
-
+STEP 2C:  Run find_missing_probes.py
 
 It will:
 
+  1. List the available chips.
+  2. Ask whether to apply calibration offsets, see Step 2D. Answer n the first
+     time if you just want a quick look.
+  3. Ask for a chip number, then a layer number.
+  4. Show the resistors on that coupon, then ask for your reading.
+  5. Print the result: which probes are NOT in contact, which are, and a decode
+     margin telling how accurate your reading must be to be sure. It warns you
+     if the answer is ambiguous or the reading looks wrong.
 
 
-&#x20;  1. List the available chips.
+STEP 2D:  Calibration
 
+The real fabricated resistors are never exactly the calculated values because
+metal thickness varies. The calibration coupon lets the decoder correct for this
+automatically from a CSV:
 
+  1. Probe each resistor on the calibration chip and note its measured value.
+  2. Open the generated calibration CSV, outputs/calibration/calibration_resistors.csv,
+     and add a column named measured_R_ohm. Fill in your reading on each row.
+  3. Copy that CSV into decode_inputs, alongside the decode key.
+  4. Run the decoder. It finds the calibration CSV, computes a per-rung scale of
+     measured divided by calculated, and multiplies every prediction by the scale
+     of its nearest rung. No typing is needed, and it is reused for the whole
+     session.
 
-&#x20;  2. Ask whether to apply CALIBRATION offsets (optional -- see Step 2D).
+If no calibration CSV with measured values is present, the decoder instead asks
+you to type each measured value by hand.
 
-&#x20;     Answer "n" the first time if you just want a quick look.
+TUNING
 
+The design knobs live at the top of io_pair_wiring_parallel.py:
 
-
-&#x20;  3. Ask for a Chip number, then a Layer number.
-
-
-
-&#x20;  4. Show the resistors on that coupon, then ask:
-
-&#x20;         "Measured resistance (e.g. 470, 1.2k, OPEN):"
-
-&#x20;     Type your reading.  Accepted formats:
-
-&#x20;         470        470 ohms
-
-&#x20;         1.2k       1200 ohms
-
-&#x20;         3.3M       3.3 megaohms
-
-&#x20;         OPEN       open circuit / over-range
-
-
-
-&#x20;  5. Print the result:  which probes are NOT in contact, which are, and a
-
-&#x20;     "decode margin" (how accurate your reading must be to be sure).  It
-
-&#x20;     warns you if the answer is ambiguous or the reading looks wrong.
-
-
-
-&#x20;**STEP 2D:  Calibration**
-
-
-
-&#x20;  1. Probe each resistor on the calibration chip with your multimeter and
-
-&#x20;     note the measured value of each one.
-
-&#x20;  2. When the decoder asks "Apply calibration offsets?", answer "y".
-
-&#x20;  3. It lists each ladder value (e.g. \~1000 ohm, \~2000 ohm, ...).  For each,
-
-&#x20;     type the value you measured on the calibration chip.
-
-&#x20;  4. From then on it adjusts every prediction to match your real hardware,
-
-&#x20;     so the decode is accurate.
-
-
-
-**TUNING**
-
-
-
-The design knobs live at the top of io\_pair\_wiring\_parallel.py:
-
-
-
-&#x20;  PAD\_SIZE            pad size in microns
-
-&#x20;  WIRE\_WIDTH          resistor trace width
-
-&#x20;  COIL\_GAP            gap from the pad to the start of its resistor
-
-&#x20;  COIL\_BASE\_R         resistance of the smallest resistor in a group
-
-&#x20;  MAX\_BINARY\_INPUTS   groups bigger than this are split across more chips
-
+```
+PAD_SIZE            pad size in microns
+WIRE_WIDTH          resistor trace width
+COIL_GAP            gap from the pad to the start of its resistor
+COIL_BASE_R         resistance of the smallest resistor in a group
+MAX_BINARY_INPUTS   groups bigger than this are split across more chips
+```

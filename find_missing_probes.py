@@ -12,17 +12,26 @@ MATCH_TOL = 0.05   # accept a subset if its predicted R is within this of measur
 # ----------------------------------------------------------------------
 # Input
 # ----------------------------------------------------------------------
+def _header(path):
+    try:
+        with open(path, newline="") as f:
+            return [h.strip().lower() for h in next(csv.reader(f))]
+    except (StopIteration, OSError):
+        return []
+
+
 def find_decode_csv():
-    """The single CSV in decode_inputs/ (any name). Errors if none or several."""
-    csvs = sorted(DECODE_DIR.glob("*.csv"))
-    if not csvs:
-        raise SystemExit(f"No .csv found in {DECODE_DIR} -- put the generator's "
-                         f"*_parallel.csv there.")
-    if len(csvs) > 1:
-        names = ", ".join(p.name for p in csvs)
-        raise SystemExit(f"Multiple .csv files in {DECODE_DIR} ({names}); keep just one, "
-                         f"or pass the path: py find_missing_probes.py <file.csv>")
-    return csvs[0]
+    """The pinout key CSV in decode_inputs/ -- the one with an 'input_pad' column, so
+    it can sit alongside a calibration CSV. Errors if none or several."""
+    hits = [p for p in sorted(DECODE_DIR.glob("*.csv")) if PAD in _header(p)]
+    if not hits:
+        raise SystemExit(f"No pinout .csv (with an input_pad column) in {DECODE_DIR} -- "
+                         f"put the generator's *_parallel.csv there.")
+    if len(hits) > 1:
+        names = ", ".join(p.name for p in hits)
+        raise SystemExit(f"Multiple pinout .csv files in {DECODE_DIR} ({names}); keep "
+                         f"one, or pass the path: py find_missing_probes.py <file.csv>")
+    return hits[0]
 
 
 def load(path):
@@ -112,6 +121,50 @@ def apply_offsets(resistors, rungs, offsets):
     return sorted(((pad, corrected(R)) for pad, R in resistors), key=lambda t: t[1])
 
 
+CAL_TARGET, CAL_CALC, CAL_MEAS = "target_r_ohm", "actual_r_ohm", "measured_r_ohm"
+
+
+def find_calibration_csv():
+    """A calibration CSV in decode_inputs/ -- the one with a target_R_ohm column."""
+    for p in sorted(DECODE_DIR.glob("*.csv")):
+        if CAL_TARGET in _header(p):
+            return p
+    return None
+
+
+def load_calibration(path):
+    """Per-rung calibration read from the generator's calibration CSV. It needs a
+    measured_R_ohm column filled in from the calibration chip; each rung's scale is
+    measured / calculated (actual_R_ohm), i.e. the real sheet-resistance ratio. Every
+    test resistor is later multiplied by the scale of its nearest rung. Returns
+    [(nominal, scale)] ascending, or None if no measurements are present."""
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return None
+    col = {k.strip().lower(): k for k in rows[0]}
+    if CAL_MEAS not in col or CAL_TARGET not in col:
+        return None
+    calc_col = col.get(CAL_CALC, col[CAL_TARGET])
+    cal = []
+    for r in rows:
+        meas = parse_ohms(r[col[CAL_MEAS]])
+        calc = float(r[calc_col]) if r[calc_col].strip() else 0.0
+        if meas not in (None, float("inf")) and calc > 0:
+            cal.append((float(r[col[CAL_TARGET]]), meas / calc))
+    return sorted(cal) or None
+
+
+def apply_calibration(resistors, cal):
+    """Scale each resistor by its nearest rung's calibration factor (measured/calc).
+    Returns a new (pad, R) list sorted by corrected resistance."""
+    noms = [n for n, _ in cal]
+    scale = dict(cal)
+    def corrected(R):
+        return R * scale[min(noms, key=lambda n: abs(n - R))]
+    return sorted(((pad, corrected(R)) for pad, R in resistors), key=lambda t: t[1])
+
+
 # ----------------------------------------------------------------------
 # Decode
 # ----------------------------------------------------------------------
@@ -156,7 +209,7 @@ def report(resistors, r_meas):
     r_all = parallel([R for _, R in resistors])
     margin = decode_margin([1.0 / R for _, R in resistors])
     print(f"\nAll-contacting parallel resistance: {r_all:,.2f} ohm "
-          f"({len(resistors)} resistor(s)).")
+          f"({len(resistors)} resistors).")
     margin_ohm = margin * r_all                      # resolution near the all-on reading
     print(f"Decode margin {margin*100:.2f}% (~{margin_ohm:,.2f} ohm): the reading must "
           f"be accurate to better than this (incl. contact resistance) for the missing "
@@ -180,7 +233,7 @@ def report(resistors, r_meas):
     if not missing:
         print("  => ALL probes in contact (no resistor missing).")
     else:
-        print(f"  => {len(missing)} probe(s) NOT in contact (missing): "
+        print(f"  => {len(missing)} probes NOT in contact (missing): "
               f"{', '.join(missing)}")
     print(f"     in contact: {', '.join(present) if present else '(none)'}")
 
@@ -206,12 +259,22 @@ def report(resistors, r_meas):
 def main():
     path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else find_decode_csv()
     rows = load(path)
-    print(f"Loaded {len(rows)} coil(s) from {path}")
+    print(f"Loaded {len(rows)} coils from {path}")
     combos = sorted({(int(r[CHIP]), int(r[LAYER])) for r in rows})
     print(f"Chips available: {sorted({c for c, _ in combos})}")
 
     rungs = canonical_rungs(rows)
-    offsets = ask_calibration(rungs)
+    cal_path = find_calibration_csv()
+    cal = load_calibration(cal_path) if cal_path else None
+    offsets = {}
+    if cal:
+        print(f"Calibrating from {cal_path.name}: per-rung scale "
+              + ", ".join(f"{n:,.0f} ohm x{s:.3f}" for n, s in cal))
+    else:
+        if cal_path:
+            print(f"Found {cal_path.name} but no measured_R_ohm values yet -- "
+                  f"fill that column in to auto-calibrate.")
+        offsets = ask_calibration(rungs)
 
     while True:                             # one decode per chip/layer; blank quits
         raw = input("\nChip # (blank to quit): ").strip()
@@ -230,16 +293,21 @@ def main():
         sel = [r for r in rows if int(r[CHIP]) == chip and int(r[LAYER]) == layer]
         resistors = sorted(((r[PAD], float(r[R_COL])) for r in sel),
                            key=lambda t: t[1])
-        if offsets:
+        if cal:
+            resistors = apply_calibration(resistors, cal)
+            note = f" (calibrated from {cal_path.name})"
+        elif offsets:
             resistors = apply_offsets(resistors, rungs, offsets)
-        note = " (calibration-corrected)" if offsets else ""
-        print(f"\nChip {chip}, layer {layer}: {len(resistors)} input resistor(s){note}")
+            note = " (calibration-corrected)"
+        else:
+            note = ""
+        print(f"\nChip {chip}, layer {layer}: {len(resistors)} input resistors{note}")
         for pad, R in resistors:
             print(f"   {pad:>12}  {R:10,.2f} ohm")
 
         ohms = None
         while ohms is None:
-            ohms = parse_ohms(input("\nMeasured resistance (e.g. 470, 1.2k, OPEN): "))
+            ohms = parse_ohms(input("\nMeasured resistance: "))
             if ohms is None:
                 print("  Couldn't read that. Try e.g. 470, 1.2k, 3.3M, or OPEN.")
         report(resistors, ohms)
