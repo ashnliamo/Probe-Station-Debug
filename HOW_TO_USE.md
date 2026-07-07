@@ -43,10 +43,15 @@ case-insensitive and extra columns are ignored. Tag each pad:
 
 INPUTn     this pad is an input  in group n
 OUTPUTn    this pad is an output in group n
+OUTPUT     a common output, shared by every group and present on every chip
 
 Pads that share the same number n form one group: every INPUTn is wired through
 its own resistor to the OUTPUTn pads. A group needs at least one INPUT and one
 OUTPUT or it is dropped.
+
+A bare OUTPUT tag, with no number, marks a common output. It is added to every
+group, so it appears on every chip. When a common OUTPUT is present the generator
+puts one group per chip, so two groups can never tie their shared output together.
 
 STEP 1B:  Run the program
 

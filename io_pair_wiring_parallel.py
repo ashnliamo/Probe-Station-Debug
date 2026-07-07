@@ -29,13 +29,22 @@ SHEET_RES = AL_RESISTIVITY / (METAL_THICKNESS_UM * 1e-6)   # ohm/square (~0.324)
 COIL_BASE_R = 1000.0          # ohms for the smallest coil in a group
 MAX_BINARY_INPUTS = 6        # split groups bigger than this into separate coupons
 
-CALIB_COUNT = 8              # number of calibration resistors (first N ladder steps)
+CALIB_COUNT = 6              # number of calibration resistors (first N ladder steps)
 CALIB_PAD = 1500.0           # calibration probe pad (um), >= 1.5 mm for a multimeter
 CALIB_LABEL = 150.0          # calibration label height (um)
 CALIB_GAP = 200.0            # calibration column/pad spacing and margin
 
+MOSAIC_GAP = 300.0           # spacing between dies in the combined tiled GDS
+
+WAFER_DIAM_UM = 150000.0     # 6-inch (150 mm) fabrication wafer
+WAFER_EDGE_EXCLUSION_UM = 3000.0  # unusable edge ring (edge bead, handling, non-uniformity)
+WAFER_STREET_UM = MOSAIC_GAP # gap between stepped reticle fields on the wafer
+WAFER_LINE_UM = 500.0        # width of the wafer-edge outline ring
+MARKER_ARM = 500.0           # length of the tile-repeat corner-marker arms (um)
+MARKER_WIDTH = 80.0          # thickness of the tile-repeat marker arms (um)
+
 ADD_LABELS = True
-LABEL_SIZE = 12.0
+LABEL_SIZE = 16.8            # pad-text height (um); IO tag + pad name inside each pad
 ADD_DIE_OUTLINE = True
 DIE_MARGIN_BUFFER = 100.0    # clearance beyond the farthest resistor (um)
 DIE_W = DIE_H = 0.0          # set in main()
@@ -45,6 +54,9 @@ VIA_BASE, VIA_DT = 20, 0
 LABEL_LAYER, LABEL_DT = 101, 0
 IO_LABEL_DT = 1
 BOUNDARY_LAYER, BOUNDARY_DT = 100, 0
+WAFER_LAYER, WAFER_DT = 104, 0   # wafer-edge overlay -- reference only, not fabricated
+WAFER_EXCL_DT = 1                 # datatype for the edge-exclusion (usable-area) ring
+MARKER_DT = 2                     # datatype for the tile-repeat corner marker
 
 
 def safe_path(path):
@@ -71,11 +83,16 @@ def via_layer(k):
 COL_PAD, COL_SIGNAL, COL_X, COL_Y = ("pad", "signal", "x (um)", "y (um)")
 COL_IO = "i/o"     # grouping column: INPUTn / OUTPUTn, blank = unused
 _IO_RE = re.compile(r"(INPUT|OUTPUT)\s*(\d+)$")
+GLOBAL_OUT = "*"   # a bare 'OUTPUT' pad: common to every group, on every chip
 
 
 def classify_io(io_cell):
-    """'INPUT3' -> ('input', 3); 'OUTPUT7' -> ('output', 7); else ('', None)."""
-    m = _IO_RE.match(io_cell.strip().upper())
+    """'INPUT3' -> ('input', 3); 'OUTPUT7' -> ('output', 7); a bare 'OUTPUT' ->
+    ('output', GLOBAL_OUT) -- a common output wired to every group; else ('', None)."""
+    s = io_cell.strip().upper()
+    if s == "OUTPUT":
+        return ("output", GLOBAL_OUT)
+    m = _IO_RE.match(s)
     if not m:
         return ("", None)
     return ("input" if m.group(1) == "INPUT" else "output", int(m.group(2)))
@@ -132,15 +149,22 @@ def place_pads(pads, raw_bounds, margins):
 
 
 def assign_groups(inputs, outputs):
-    """Group pads by IO number, keeping only numbers with BOTH an input and an
-    output. Returns [{"num", "inputs", "outputs"}] sorted by number."""
+    """Group pads by IO number. A group needs inputs and at least one output -- its own
+    OUTPUTn or a bare 'OUTPUT' pad, which is common to every group (so it appears on
+    every chip). Returns [{"num", "inputs", "outputs"}] sorted by number."""
+    common = [p for p in outputs if p["group"] == GLOBAL_OUT]
     in_by, out_by = {}, {}
     for p in inputs:
         in_by.setdefault(p["group"], []).append(p)
     for p in outputs:
-        out_by.setdefault(p["group"], []).append(p)
-    return [{"num": g, "inputs": in_by[g], "outputs": out_by[g]}
-            for g in sorted(set(in_by) & set(out_by))]
+        if p["group"] != GLOBAL_OUT:
+            out_by.setdefault(p["group"], []).append(p)
+    groups = []
+    for n in sorted(in_by):
+        outs = out_by.get(n, []) + common          # own outputs first, then the common
+        if outs:
+            groups.append({"num": n, "inputs": in_by[n], "outputs": outs})
+    return groups
 
 
 def split_coupons(groups, max_in):
@@ -525,6 +549,16 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads):
     plane = (px0, py0, px1, py1)
     edge_coords = near_edge_coords(all_pads, bounds)
 
+    if ADD_LABELS:                                   # name the coupon on the plane
+        ins = ", ".join(p["name"] for p in ordered_inputs(group))
+        outs = ", ".join(p["name"] for p in group["outputs"])
+        txt = f"Inputs: {ins}, Outputs: {outs}"
+        size = min(200.0, max(40.0, (px1 - px0) * 0.8 / (0.62 * len(txt)))) * 0.7
+        cx = (px0 + px1) / 2.0 - 0.62 * size * len(txt) / 2.0      # centre horizontally
+        cy = (py0 + py1) / 2.0 - size / 2.0 + (1 - 2 * layer_idx) * size * 1.6
+        cell.add(*gdstk.text(txt, size, (cx, cy),                 # 2-layer chips stack
+                             layer=LABEL_LAYER, datatype=LABEL_DT))
+
     # One disjoint along-edge band per input (width ~ trace length); solved below.
     band_of, gaps_of = {}, {}
     for e, items in edge_inputs(group, bounds).items():
@@ -696,6 +730,124 @@ def build_calibration(resistances):
         cell.add(gdstk.rectangle((0.0, 0.0), (die_w, -die_h),
                                  layer=BOUNDARY_LAYER, datatype=BOUNDARY_DT))
     return lib, rows, die_w, die_h
+
+
+def mosaic_place(entries, gap, cols):
+    """Row-major placement of `(cell, w, h)` entries into `cols` columns. Returns
+    (origins, field_w, field_h): origins[i] is the top-left corner of entry i
+    (each cell spans [x, x+w] x [y-h, y], matching the die outline convention),
+    field_w is the widest row, field_h the total stack height."""
+    origins, x, y, row_h, max_w = [], 0.0, 0.0, 0.0, 0.0
+    for i, (c, w, h) in enumerate(entries):
+        if i % cols == 0 and i:
+            max_w = max(max_w, x - gap)               # drop the trailing gap
+            x, y, row_h = 0.0, y - row_h - gap, 0.0
+        origins.append((x, y))
+        x += w + gap
+        row_h = max(row_h, h)
+    max_w = max(max_w, x - gap)                        # last row
+    return origins, max_w, row_h - y                   # y <= 0, so height = row_h - y
+
+
+def wafer_field_origins(fw, fh, diam, street, edge_excl, offset=(0.0, 0.0)):
+    """Top-left origins of every step-and-repeat field whose WHOLE footprint fits
+    inside the usable wafer radius (diam/2 - edge_excl), for an array shifted by
+    `offset` from the wafer centre. The array is periodic in `step`, so sweeping
+    offsets over one period finds the best centring."""
+    r = diam / 2.0 - edge_excl
+    step_x, step_y = fw + street, fh + street
+    ox0, oy0 = offset
+    ni = math.ceil(diam / 2.0 / step_x) + 2
+    nj = math.ceil(diam / 2.0 / step_y) + 2
+    out = []
+    for i in range(-ni, ni + 1):
+        for j in range(-nj, nj + 1):
+            ox = i * step_x - fw / 2.0 + ox0
+            oy = j * step_y + fh / 2.0 + oy0
+            corners = [(ox, oy), (ox + fw, oy), (ox, oy - fh), (ox + fw, oy - fh)]
+            if all(math.hypot(cx, cy) <= r for cx, cy in corners):
+                out.append((ox, oy))
+    return out
+
+
+def best_field_layout(entries, gap, diam, street, edge_excl):
+    """Pick the mosaic column count -- and the array-centring offset -- that packs
+    the most complete fields onto the wafer. Every field holds all the dies, so
+    maximising fields maximises good dies. This is the shot-map optimisation a
+    real stepper flow does: sweep the layout aspect ratio and the wafer-centre
+    offset instead of guessing columns from sqrt(n). Returns
+    (cols, field_w, field_h, field_origins)."""
+    n = len(entries)
+    fracs = (0.0, 0.25, 0.5, 0.75)                     # offset samples over one period
+    best = None
+    for cols in range(1, n + 1):
+        _, fw, fh = mosaic_place(entries, gap, cols)
+        step_x, step_y = fw + street, fh + street
+        for a in fracs:
+            for b in fracs:
+                fields = wafer_field_origins(fw, fh, diam, street, edge_excl,
+                                             (-a * step_x, -b * step_y))
+                # Prefer more fields; break ties toward the squarer, tighter field.
+                key = (len(fields), -max(fw, fh))
+                if best is None or key > best[0]:
+                    best = (key, cols, fw, fh, fields)
+    _, cols, fw, fh, fields = best
+    return cols, fw, fh, fields
+
+
+def tile_marker(layer, dt):
+    """Right-angle corner bracket framing the field's top-left corner (the repeat
+    origin at (0, 0)). Both arms sit in the surrounding street -- one just above
+    the top edge, one just left of the left edge -- so the marker never overlaps
+    a die. Because it lives in the stepped field, it recurs at the top-left of
+    every tile, showing where the pattern repeats across the wafer."""
+    return [
+        gdstk.rectangle((0.0, 0.0), (MARKER_ARM, MARKER_WIDTH),        # top arm ->
+                        layer=layer, datatype=dt),
+        gdstk.rectangle((-MARKER_WIDTH, -MARKER_ARM), (0.0, 0.0),      # left arm v
+                        layer=layer, datatype=dt),
+    ]
+
+
+def build_mosaic(entries, gap, cols):
+    """Tile every (cell, w, h) entry -- each chip plus the calibration coupon --
+    into one MOSAIC cell of `cols` columns, so the whole chip-set is a single
+    reusable field. Cells keep their own layers/positions; this only adds a top
+    MOSAIC cell with a translated Reference per die, plus a corner marker at the
+    field's top-left showing the repeat origin. Returns (Library, field_w,
+    field_h); the library holds every referenced cell too, so the GDS is
+    self-contained."""
+    origins, fw, fh = mosaic_place(entries, gap, cols)
+    lib = gdstk.Library(unit=1e-6, precision=1e-9)
+    lib.add(*[c for c, _, _ in entries])
+    top = lib.new_cell("MOSAIC")
+    for (c, w, h), origin in zip(entries, origins):
+        top.add(gdstk.Reference(c, origin=origin))
+    for poly in tile_marker(WAFER_LAYER, MARKER_DT):
+        top.add(poly)
+    return lib, fw, fh
+
+
+def build_wafer(field_lib, field_origins, diam, edge_excl, layer, dt):
+    """Step-and-repeat the field_lib's MOSAIC cell (every chip + the calibration
+    coupon) across a circular wafer, one Reference per pre-solved field origin.
+    Added LAST, on an overlay layer that is NOT fabricated: the physical wafer
+    edge (full radius) and, as a thinner inner ring, the edge-exclusion boundary
+    -- the usable-area limit the fields are packed inside. Returns
+    (Library, fields_placed)."""
+    field = next(c for c in field_lib.cells if c.name == "MOSAIC")
+    lib = gdstk.Library(unit=1e-6, precision=1e-9)
+    lib.add(*field_lib.cells)
+    top = lib.new_cell("WAFER")
+    for origin in field_origins:
+        top.add(gdstk.Reference(field, origin=origin))
+    r = diam / 2.0
+    top.add(gdstk.ellipse((0.0, 0.0), r, inner_radius=r - WAFER_LINE_UM,
+                          tolerance=20.0, layer=layer, datatype=dt))
+    ru = r - edge_excl
+    top.add(gdstk.ellipse((0.0, 0.0), ru, inner_radius=ru - WAFER_LINE_UM / 2.0,
+                          tolerance=20.0, layer=layer, datatype=WAFER_EXCL_DT))
+    return lib, len(field_origins)
 
 
 # ----------------------------------------------------------------------
@@ -921,6 +1073,10 @@ def main():
     if not inputs or not outputs:
         raise SystemExit("Need at least one input and one output.")
     groups = assign_groups(inputs, outputs)
+    if any(p["group"] == GLOBAL_OUT for p in outputs) and groups_per_chip > 1:
+        print("  ! A common OUTPUT pad is shared by every group; using 1 group per "
+              "chip so two groups can't tie their shared output together.")
+        groups_per_chip = 1
     coupons = split_coupons(groups, MAX_BINARY_INPUTS)   # big groups -> sub-coupons
 
     edge_depth, ring_w, ring_h, scale = size_and_place(pads, coupons)
@@ -963,6 +1119,7 @@ def main():
         nsub[c["num"]] = nsub.get(c["num"], 0) + 1
     tag = lambda c: f"{c['num']}.{c['sub']}" if nsub[c["num"]] > 1 else f"{c['num']}"
     all_rows = []
+    mosaic_entries = []
     for ci, chip_coupons in enumerate(chips, 1):
         lib, geo, rows = build_chip(ci, chip_coupons, pads, bounds)
         all_rows.extend(rows)
@@ -971,6 +1128,7 @@ def main():
         lib.write_gds(gds_out)
         safe_path(SCHEMATIC_DIR / f"schematic_{'_'.join(tags)}.svg").write_text(
             build_schematic_svg(ci, rows), encoding="utf-8")   # circuit diagram
+        mosaic_entries.append((lib.cells[0], DIE_W, DIE_H))
 
         shorts = find_shorts(geo, len(chip_coupons))
         if shorts:
@@ -995,6 +1153,25 @@ def main():
         w = csv.writer(f)
         w.writerow(["target_R_ohm", "actual_R_ohm", "squares", "trace_len_um"])
         w.writerows(calib_rows)
+    mosaic_entries.append((calib_lib.cells[0], cdw, cdh))
+
+    # Combined mask: every chip plus the calibration coupon tiled into one field,
+    # then that field stepped-and-repeated to fill a 6-inch wafer, with the wafer
+    # edge drawn last as an overlay ring. The field's column count and the array
+    # centring are solved to pack the most complete fields onto the usable wafer
+    # (inside the edge-exclusion ring) -- a shot-map optimisation, not sqrt(n).
+    cols, fw, fh, field_origins = best_field_layout(
+        mosaic_entries, MOSAIC_GAP, WAFER_DIAM_UM, WAFER_STREET_UM,
+        WAFER_EDGE_EXCLUSION_UM)
+    mosaic_lib, fw, fh = build_mosaic(mosaic_entries, MOSAIC_GAP, cols)
+    wafer_lib, n_fields = build_wafer(mosaic_lib, field_origins, WAFER_DIAM_UM,
+                                      WAFER_EDGE_EXCLUSION_UM, WAFER_LAYER, WAFER_DT)
+    wafer_gds = safe_path(OUTPUT_DIR / "all_tiled_chips.gds")
+    wafer_lib.write_gds(wafer_gds)
+    print(f"Wrote {wafer_gds.name}: {len(mosaic_entries)} dies in a {cols}-col field "
+          f"({fw/1000:.1f} x {fh/1000:.1f} mm) -> {n_fields} fields, "
+          f"{n_fields * len(mosaic_entries)} dies on a {WAFER_DIAM_UM/1000:.0f} mm "
+          f"wafer ({WAFER_EDGE_EXCLUSION_UM/1000:.0f} mm edge exclusion).")
     fit = "" if (cdw, cdh) == (DIE_W, DIE_H) else " (enlarged to fit its content)"
     # print(f"Wrote {calib_gds.name}: {cdw/1000:.1f}x{cdh/1000:.1f} mm die matching the "
     #       f"test chips{fit}, COMMON pad + {len(calib_rows)} probe pads "
