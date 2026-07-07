@@ -55,7 +55,6 @@ LABEL_LAYER, LABEL_DT = 101, 0
 IO_LABEL_DT = 1
 BOUNDARY_LAYER, BOUNDARY_DT = 100, 0
 WAFER_LAYER, WAFER_DT = 104, 0   # wafer-edge overlay -- reference only, not fabricated
-WAFER_EXCL_DT = 1                 # datatype for the edge-exclusion (usable-area) ring
 MARKER_DT = 2                     # datatype for the tile-repeat corner marker
 
 
@@ -828,13 +827,12 @@ def build_mosaic(entries, gap, cols):
     return lib, fw, fh
 
 
-def build_wafer(field_lib, field_origins, diam, edge_excl, layer, dt):
+def build_wafer(field_lib, field_origins, diam, layer, dt):
     """Step-and-repeat the field_lib's MOSAIC cell (every chip + the calibration
     coupon) across a circular wafer, one Reference per pre-solved field origin.
     Added LAST, on an overlay layer that is NOT fabricated: the physical wafer
-    edge (full radius) and, as a thinner inner ring, the edge-exclusion boundary
-    -- the usable-area limit the fields are packed inside. Returns
-    (Library, fields_placed)."""
+    edge (full radius). Fields are still packed inside the edge-exclusion limit;
+    that boundary just isn't drawn. Returns (Library, fields_placed)."""
     field = next(c for c in field_lib.cells if c.name == "MOSAIC")
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
     lib.add(*field_lib.cells)
@@ -844,9 +842,6 @@ def build_wafer(field_lib, field_origins, diam, edge_excl, layer, dt):
     r = diam / 2.0
     top.add(gdstk.ellipse((0.0, 0.0), r, inner_radius=r - WAFER_LINE_UM,
                           tolerance=20.0, layer=layer, datatype=dt))
-    ru = r - edge_excl
-    top.add(gdstk.ellipse((0.0, 0.0), ru, inner_radius=ru - WAFER_LINE_UM / 2.0,
-                          tolerance=20.0, layer=layer, datatype=WAFER_EXCL_DT))
     return lib, len(field_origins)
 
 
@@ -1165,7 +1160,7 @@ def main():
         WAFER_EDGE_EXCLUSION_UM)
     mosaic_lib, fw, fh = build_mosaic(mosaic_entries, MOSAIC_GAP, cols)
     wafer_lib, n_fields = build_wafer(mosaic_lib, field_origins, WAFER_DIAM_UM,
-                                      WAFER_EDGE_EXCLUSION_UM, WAFER_LAYER, WAFER_DT)
+                                      WAFER_LAYER, WAFER_DT)
     wafer_gds = safe_path(OUTPUT_DIR / "all_tiled_chips.gds")
     wafer_lib.write_gds(wafer_gds)
     print(f"Wrote {wafer_gds.name}: {len(mosaic_entries)} dies in a {cols}-col field "
