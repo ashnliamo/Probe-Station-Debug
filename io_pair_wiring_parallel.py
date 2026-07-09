@@ -7,8 +7,8 @@ import pathlib
 import gdstk
 
 HERE = pathlib.Path(__file__).parent
-INPUT_DIR = HERE / "inputs"
-OUTPUT_DIR = HERE / "outputs"
+INPUT_DIR = HERE / "io_pair_inputs"
+OUTPUT_DIR = HERE / "io_pair_outputs"
 GDS_DIR = OUTPUT_DIR / "gds"                # chip mask GDS files
 SCHEMATIC_DIR = OUTPUT_DIR / "schematics"  # per-chip circuit diagrams (SVG)
 CALIB_DIR = OUTPUT_DIR / "calibration"     # calibration coupon GDS + CSV
