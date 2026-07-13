@@ -44,6 +44,8 @@ PROBE_PAD_CLEARANCE = 200   # min gap between adjacent probe lands
 PROBE_PAD_PITCH = PROBE_PAD_SIDE + PROBE_PAD_CLEARANCE
 EDGE_CLEARANCE = 25000      # 3 cm: min distance from a probe land to the die edge
 
+BOARD_CENTER = (4000 * 25.4, 3000 * 25.4)   # place board/die centre here (um);
+                                            # 4000 x 3000 mil -> keeps board on-sheet
 VIA_DRILL = 508             # 0.02" plated through-hole (um)
 MASK_EXPAND = 50            # soldermask opening = land radius + this (um)
 CARD_SIZE = 114300          # 4.5" square board outline (um)
@@ -182,6 +184,12 @@ def place_probes(sides, cx, cy, scale):
 
 
 def compute_layout(pads):
+    # translate all pads so the die/board centre sits at BOARD_CENTER
+    cx0, cy0 = die_center(pads)
+    dx, dy = BOARD_CENTER[0] - cx0, BOARD_CENTER[1] - cy0
+    for p in pads:
+        p["x"] += dx
+        p["y"] += dy
     cx, cy = die_center(pads)
     sides = group_by_side(pads, cx, cy)
     scale = required_scale(sides)
@@ -285,19 +293,6 @@ def clear_board(board):
 # ----------------------------------------------------------------------------
 # builders
 # ----------------------------------------------------------------------------
-def build_drawing(board, pads, L):
-    """Quick layout drawing with gr_rect graphics (the original output)."""
-    cx, cy, scale = L["cx"], L["cy"], L["scale"]
-    clear_board(board)
-    items = [rect(cx, cy, DIE_X, DIE_Y, LAYER_EDGE),
-             rect(cx, cy, scale * DIE_X, scale * DIE_Y, LAYER_REF)]
-    for p in pads:
-        items.append(square(p["x"], p["y"], DIE_PAD_SIDE, LAYER_B_CU, filled=True))
-    for pr in L["probes"]:
-        items.append(square(pr["x"], pr["y"], PROBE_PAD_SIDE, LAYER_F_CU, filled=True))
-    board.create_items(items)
-
-
 def build_fab(board, pads, L):
     """Manufacturable board: outline + aperture cutout + solderable via-lands."""
     cx, cy, scale = L["cx"], L["cy"], L["scale"]
@@ -548,12 +543,19 @@ End;
 
     # ---- entry point ----
     w(f"""Procedure GenerateProbeCard;
-Var Doc;
 Begin
-    If PCBServer = Nil Then Exit;
-    Client.OpenNewDocumentOfKind('PCB');
+    If PCBServer = Nil Then
+    Begin
+        ShowMessage('PCBServer is nil -- the PCB editor is not loaded.');
+        Exit;
+    End;
     Board := PCBServer.GetCurrentPCBBoard;
-    If Board = Nil Then Exit;
+    If Board = Nil Then
+    Begin
+        ShowMessage('No PCB is open. Create a blank PCB first: ' +
+            'File > New > PCB, make that tab active, then run this script again.');
+        Exit;
+    End;
     PCBServer.PreProcess;
     SetRectBoard({mm((cx-H)/1000)}, {mm((cy-H)/1000)}, {mm((cx+H)/1000)}, {mm((cy+H)/1000)});
     AddCutout({mm((cx-cw/2)/1000)}, {mm((cy-ch/2)/1000)}, {mm((cx+cw/2)/1000)}, {mm((cy+ch/2)/1000)});
@@ -566,8 +568,8 @@ Begin
     PCBServer.PostProcess;
     Board.ViewManager_FullUpdate;
     Client.SendMessage('PCB:Zoom', 'Action=Redraw', 255, Client.CurrentView);
-    Doc := GetWorkspace.DM_FocusedDocument;
-    If Doc <> Nil Then Doc.DM_SaveAsNew({_pas_str(pcbdoc)});
+    ShowMessage('Probe card built on the active PCB. ' +
+        'Use File > Save As to save it as a .PcbDoc.');
 End;
 """)
 
@@ -628,11 +630,6 @@ def main():
         print(f"\nKiCad not reachable -- skipped .kicad_pcb outputs "
               f"(open a board in KiCad and rerun). Details: {e}")
         return
-
-    build_drawing(board, pads, L)
-    draw_path = OUTPUT_DIR / f"{csv_path.stem}_probe_pcb.kicad_pcb"
-    board.save_as(str(draw_path), overwrite=True)
-    print(f"Wrote drawing:      {draw_path}")
 
     build_fab(board, pads, L)
     fab_path = OUTPUT_DIR / f"{csv_path.stem}_probe_card.kicad_pcb"
