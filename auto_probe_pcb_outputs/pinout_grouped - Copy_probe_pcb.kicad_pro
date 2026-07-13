@@ -264,7 +264,7 @@
     "pinned_symbol_libs": []
   },
   "meta": {
-    "filename": "pinout_grouped - Copy_probe_pcb.kicad_pro",
+    "filename": "temp7.kicad_pro",
     "version": 3
   },
   "net_settings": {
@@ -310,13 +310,7 @@
     "bus_aliases": {},
     "legacy_lib_dir": "",
     "legacy_lib_list": [],
-    "top_level_sheets": [
-      {
-        "filename": "pinout_grouped - Copy_probe_pcb.kicad_sch",
-        "name": "pinout_grouped - Copy_probe_pcb",
-        "uuid": "00000000-0000-0000-0000-000000000000"
-      }
-    ]
+    "top_level_sheets": []
   },
   "sheets": [],
   "text_variables": {},
