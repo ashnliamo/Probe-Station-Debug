@@ -49,12 +49,14 @@ BOARD_CENTER = (4000 * 25.4, 3000 * 25.4)   # place board/die centre here (um);
 VIA_DRILL = 508             # 0.02" plated through-hole (um)
 MASK_EXPAND = 50            # soldermask opening = land radius + this (um)
 CARD_SIZE = 114300          # 4.5" square board outline (um)
-APERTURE_INSET = PROBE_PAD_SIDE / 2 + 300   # cut edge sits this far inside lands
+APERTURE_CLEARANCE = 10000  # 1 cm: die's nearest point (corner) to circular aperture edge
+MARKER_CLEARANCE = 15000    # 15 mm: min die-to-marker-rectangle clearance (all sides)
 
 LABEL_SIZE = 400            # signal-label text height (um)
 LABEL_THICK = 60            # label stroke width (um)
 LABEL_GAP = 200             # gap from land edge to start of its label (um)
 PROBE_WIRE_WIDTH = 150      # visual probe-needle line width (um); not fabricated
+MARKER_LINE = 150           # marker-rectangle line width (um); not fabricated
 
 # --- KiCad layers ---
 LAYER_EDGE     = "BL_Edge_Cuts"
@@ -65,9 +67,11 @@ LAYER_F_MASK   = "BL_F_Mask"
 LAYER_B_MASK   = "BL_B_Mask"
 LAYER_F_SILK   = "BL_F_SilkS"
 LAYER_PROBE    = "BL_Cmts_User"     # probe needles: visual only, not fabricated
+LAYER_MARKER   = "BL_User_1"        # die-aspect clearance marker: not fabricated
 
 # --- Altium DelphiScript export layers (mechanical layers used for docs) ---
 ALTIUM_OUTLINE_LAYER = "eMechanical1"    # board outline + aperture guide
+ALTIUM_MARKER_LAYER  = "eMechanical15"   # die-aspect clearance marker rectangle
 ALTIUM_REF_LAYER     = "eMechanical13"   # die, die pads, probe wires (reference)
 
 
@@ -197,6 +201,20 @@ def compute_layout(pads):
     return {"cx": cx, "cy": cy, "sides": sides, "scale": scale, "probes": probes}
 
 
+def aperture_radius():
+    """Circular aperture radius: 1 cm beyond the die's nearest point to the
+    circle -- i.e. the die corner (half-diagonal), which is the closest the
+    die gets to a circle centred on it."""
+    return math.hypot(DIE_X / 2.0, DIE_Y / 2.0) + APERTURE_CLEARANCE
+
+
+def marker_dims():
+    """A rectangle with the die's aspect ratio, scaled so the die is >= 15 mm
+    inside it on every side (the smaller dimension is the binding one)."""
+    s = 1.0 + 2.0 * MARKER_CLEARANCE / min(DIE_X, DIE_Y)
+    return s * DIE_X, s * DIE_Y
+
+
 # ----------------------------------------------------------------------------
 # kicad primitives (um in, mm out)
 # ----------------------------------------------------------------------------
@@ -298,11 +316,12 @@ def build_fab(board, pads, L):
     cx, cy, scale = L["cx"], L["cy"], L["scale"]
     clear_board(board)
     items = []
-    # board outline + aperture cutout (both closed Edge.Cuts loops)
+    # board outline (square) + circular aperture cutout (both Edge.Cuts)
     items.append(rect(cx, cy, CARD_SIZE, CARD_SIZE, LAYER_EDGE))
-    cut_w = scale * DIE_X - 2 * APERTURE_INSET
-    cut_h = scale * DIE_Y - 2 * APERTURE_INSET
-    items.append(rect(cx, cy, cut_w, cut_h, LAYER_EDGE))
+    items.append(circle(cx, cy, aperture_radius(), LAYER_EDGE))
+    # non-fabricated die-aspect clearance marker rectangle
+    mw, mh = marker_dims()
+    items.append(rect(cx, cy, mw, mh, LAYER_MARKER))
     # reference-only die + die pads (not fabricated)
     items.append(rect(cx, cy, DIE_X, DIE_Y, LAYER_REF))
     for p in pads:
@@ -339,11 +358,13 @@ def _altium_label(pr):
     """Anchor (mm), rotation (deg) and text for an Altium silk label, placed so
     it reads radially outward. Altium stroke text is anchored bottom-left and
     extends up/right, so left/bottom labels are shifted by an estimated length."""
-    off = (PROBE_PAD_SIDE / 2.0 + LABEL_GAP) / 1000.0
+    off = (PROBE_PAD_SIDE / 2.0 + LABEL_GAP + 250) / 1000.0
     h = LABEL_SIZE / 1000.0
     x, y = pr["x"] / 1000.0, pr["y"] / 1000.0
     sig = pr["die"]["signal"] or pr["id"]
-    ln = max(1, len(sig)) * h * 0.75  # rough text length
+    # over-estimate the rendered length so bottom/left labels (anchored at their
+    # far end) keep their NEAR end clear of the pad instead of overrunning it.
+    ln = max(1, len(sig)) * h * 1.1
     if pr["side"] == "T":
         return (x - h / 2, y + off, 90.0, sig)
     if pr["side"] == "B":
@@ -365,8 +386,8 @@ def write_altium_script(path, pads, L):
     signal labels, and reference die/die-pads/probe-wires on a mech layer."""
     cx, cy, scale = L["cx"], L["cy"], L["scale"]
     H = CARD_SIZE / 2.0
-    cw = scale * DIE_X - 2 * APERTURE_INSET
-    ch = scale * DIE_Y - 2 * APERTURE_INSET
+    APR = aperture_radius()          # circular aperture radius (um)
+    MW, MH = marker_dims()           # marker rectangle size (um)
     PAD = PROBE_PAD_SIDE / 1000.0
     HOLE = VIA_DRILL / 1000.0
     TEXTH = LABEL_SIZE / 1000.0
@@ -515,6 +536,43 @@ Begin
     Rgn.Layer := eTopLayer;
     RegisterObj(Rgn);
 End;
+
+// --- circular aperture: board-cutout region approximated by a 72-gon.
+Procedure AddCircleCutout(CXmm, CYmm, Rmm : Double);
+Var Rgn, C, i, ang;
+Begin
+    Rgn := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
+    Rgn.SetState_Kind(eRegionKind_BoardCutout);
+    C := PCBServer.PCBContourFactory;
+    For i := 0 To 71 Do
+    Begin
+        ang := i * 6.28318530717959 / 72.0;
+        C.AddPoint(MMsToCoord(CXmm + Rmm * Cos(ang)), MMsToCoord(CYmm + Rmm * Sin(ang)));
+    End;
+    Rgn.SetOutlineContour(C);
+    Rgn.Layer := eTopLayer;
+    RegisterObj(Rgn);
+End;
+
+// --- die-aspect clearance marker on a non-fabricated mechanical layer.
+Procedure AddMarkerTrack(X1, Y1, X2, Y2, Wid : Double);
+Var Tr;
+Begin
+    Tr := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
+    Tr.X1 := MMsToCoord(X1); Tr.Y1 := MMsToCoord(Y1);
+    Tr.X2 := MMsToCoord(X2); Tr.Y2 := MMsToCoord(Y2);
+    Tr.Width := MMsToCoord(Wid);
+    Tr.Layer := {ALTIUM_MARKER_LAYER};
+    RegisterObj(Tr);
+End;
+
+Procedure AddMarkerRect(X1, Y1, X2, Y2, Wid : Double);
+Begin
+    AddMarkerTrack(X1, Y1, X2, Y1, Wid);
+    AddMarkerTrack(X2, Y1, X2, Y2, Wid);
+    AddMarkerTrack(X2, Y2, X1, Y2, Wid);
+    AddMarkerTrack(X1, Y2, X1, Y1, Wid);
+End;
 """)
 
     # ---- data procedures ----
@@ -558,8 +616,8 @@ Begin
     End;
     PCBServer.PreProcess;
     SetRectBoard({mm((cx-H)/1000)}, {mm((cy-H)/1000)}, {mm((cx+H)/1000)}, {mm((cy+H)/1000)});
-    AddCutout({mm((cx-cw/2)/1000)}, {mm((cy-ch/2)/1000)}, {mm((cx+cw/2)/1000)}, {mm((cy+ch/2)/1000)});
-    AddOutlineRect({mm((cx-cw/2)/1000)}, {mm((cy-ch/2)/1000)}, {mm((cx+cw/2)/1000)}, {mm((cy+ch/2)/1000)}, 0.1);
+    AddCircleCutout({mm(cx/1000)}, {mm(cy/1000)}, {mm(APR/1000)});
+    AddMarkerRect({mm((cx-MW/2)/1000)}, {mm((cy-MH/2)/1000)}, {mm((cx+MW/2)/1000)}, {mm((cy+MH/2)/1000)}, {mm(MARKER_LINE/1000)});
     AddRefRect({mm((cx-DIE_X/2)/1000)}, {mm((cy-DIE_Y/2)/1000)}, {mm((cx+DIE_X/2)/1000)}, {mm((cy+DIE_Y/2)/1000)}, 0.05);
     BuildDiePads;
     BuildLands;
