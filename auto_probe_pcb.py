@@ -1,83 +1,45 @@
-"""Probe-card PCB generator.
-
-Reads a CSV of die probing-pad coordinates and produces TWO KiCad files:
-
-  1. <stem>_probe_pcb.kicad_pcb   -- a quick LAYOUT DRAWING (gr_rect graphics):
-        die outline, aperture, die pads (B.Cu), probe pads (F.Cu).
-
-  2. <stem>_probe_card.kicad_pcb  -- a MANUFACTURABLE board to fab and send to
-        Accuprobe:
-          * 4.5" square board outline with the aperture cut out (Edge.Cuts)
-          * probe soldering lands = through-vias, 1000 um land + 0.02" plated
-            drill, with soldermask openings on both sides (solderable + top-side
-            signal tap)
-          * die + die pads drawn as reference only on Dwgs.User (NOT fabricated)
-     plus <stem>_wiring_map.csv mapping every land -> signal + position.
-
-Probe lands sit on a rectangle geometrically similar to the die ("aperture")
-scaled up so every land is >= EDGE_CLEARANCE (3 cm) from the die edge and the
-1000 um lands never collide. Within each side the lands keep die order and are
-placed to minimise lateral deviation (optimal L2 fan-out) -> minimum probe
-length, no crossing, no collision.
-"""
-
 import csv
 import math
 import pathlib
-
-from kipy import KiCad
-from kipy import board_types as bt
-from kipy import common_types as ct
-from kipy.geometry import Vector2
 
 HERE = pathlib.Path(__file__).parent
 INPUT_DIR = HERE / "auto_probe_pcb_inputs"
 OUTPUT_DIR = HERE / "auto_probe_pcb_outputs"
 COL_PAD, COL_SIGNAL, COL_X, COL_Y = ("pad", "signal", "x (um)", "y (um)")
 
-# --- geometry, all in um ---
-DIE_X = 8170.73             # die "length" (x extent)
-DIE_Y = 5155.584            # die "width"  (y extent)
-DIE_PAD_SIDE = 80           # chip probing-pad size
-PROBE_PAD_SIDE = 1000       # probe soldering-land size (annular copper OD)
-PROBE_PAD_CLEARANCE = 200   # min gap between adjacent probe lands
+DIE_X = 8170.73
+DIE_Y = 5155.584
+DIE_PAD_SIDE = 80
+PROBE_PAD_SIDE = 1000
+PROBE_PAD_CLEARANCE = 200
 PROBE_PAD_PITCH = PROBE_PAD_SIDE + PROBE_PAD_CLEARANCE
-EDGE_CLEARANCE = 25000      # 3 cm: min distance from a probe land to the die edge
+PROBE_WIRE_WIDTH = 150
 
-BOARD_CENTER = (4000 * 25.4, 3000 * 25.4)   # place board/die centre here (um);
-                                            # 4000 x 3000 mil -> keeps board on-sheet
-VIA_DRILL = 508             # 0.02" plated through-hole (um)
-MASK_EXPAND = 50            # soldermask opening = land radius + this (um)
-CARD_SIZE = 114300          # 4.5" square board outline (um)
-APERTURE_CLEARANCE = 10000  # 1 cm: die's nearest point (corner) to circular aperture edge
-MARKER_CLEARANCE = 15000    # 15 mm: min die-to-marker-rectangle clearance (all sides)
+LAND_ROWS = 2
+NEEDLE_CLEARANCE = 127
+ROW_GAP = PROBE_PAD_SIDE + PROBE_PAD_CLEARANCE
+ROW_PITCH = max(PROBE_PAD_PITCH,
+                PROBE_PAD_SIDE + PROBE_WIRE_WIDTH + 2 * NEEDLE_CLEARANCE)
+STAGGER_STEP = ROW_PITCH / float(LAND_ROWS)
 
-LABEL_SIZE = 400            # signal-label text height (um)
-LABEL_THICK = 60            # label stroke width (um)
-LABEL_GAP = 200             # gap from land edge to start of its label (um)
-PROBE_WIRE_WIDTH = 150      # visual probe-needle line width (um); not fabricated
-MARKER_LINE = 150           # marker-rectangle line width (um); not fabricated
+BOARD_CENTER = (4000 * 25.4, 3000 * 25.4)
+VIA_DRILL = 508 # 0.02" via hole
+BOARD_WIDTH = 114500
+BOARD_HEIGHT = 188500
+APERTURE_CLEARANCE = 3175
+KEEP_OUT_WIDTH = 44450
+KEEP_OUT_HEIGHT = 38100
+LAND_KEEPOUT_GAP = 1500
 
-# --- KiCad layers ---
-LAYER_EDGE     = "BL_Edge_Cuts"
-LAYER_REF      = "BL_Dwgs_User"     # die + die pads: reference only, not fabricated
-LAYER_F_CU     = "BL_F_Cu"
-LAYER_B_CU     = "BL_B_Cu"
-LAYER_F_MASK   = "BL_F_Mask"
-LAYER_B_MASK   = "BL_B_Mask"
-LAYER_F_SILK   = "BL_F_SilkS"
-LAYER_PROBE    = "BL_Cmts_User"     # probe needles: visual only, not fabricated
-LAYER_MARKER   = "BL_User_1"        # die-aspect clearance marker: not fabricated
+LABEL_SIZE = 400
+LABEL_THICK = 60
+LABEL_GAP = 508
+MARKER_LINE = 150
 
-# --- Altium DelphiScript export layers (mechanical layers used for docs) ---
-ALTIUM_OUTLINE_LAYER = "eMechanical1"    # board outline + aperture guide
-ALTIUM_MARKER_LAYER  = "eMechanical15"   # die-aspect clearance marker rectangle
-ALTIUM_REF_LAYER     = "eMechanical13"   # die, die pads, probe wires (reference)
+ALTIUM_MARKER_LAYER  = "eMechanical15"
+ALTIUM_REF_LAYER     = "eMechanical13"
 
 
-# ----------------------------------------------------------------------------
-# input
-# ----------------------------------------------------------------------------
 def read_pads(csv_path):
     with open(csv_path, newline="") as f:
         rows = list(csv.reader(f))
@@ -106,9 +68,6 @@ def read_pads(csv_path):
     return pads
 
 
-# ----------------------------------------------------------------------------
-# layout math
-# ----------------------------------------------------------------------------
 def die_center(pads):
     xs = [p["x"] for p in pads]
     ys = [p["y"] for p in pads]
@@ -131,13 +90,11 @@ def group_by_side(pads, cx, cy):
 
 
 def pava_min_pitch(targets, pitch):
-    """Place points near sorted `targets` with consecutive gap >= pitch,
-    minimising sum of squared deviation (pool-adjacent-violators). Keeps order."""
     n = len(targets)
     if n == 0:
         return []
     a = [targets[i] - i * pitch for i in range(n)]
-    blocks = []  # [mean, count]
+    blocks = []
     for x in a:
         blocks.append([x, 1])
         while len(blocks) >= 2 and blocks[-2][0] > blocks[-1][0]:
@@ -151,44 +108,45 @@ def pava_min_pitch(targets, pitch):
 
 
 def required_scale(sides):
-    """Smallest uniform scale of the die rectangle so the aperture clears the die
-    by EDGE_CLEARANCE on every side AND each side fits its lands without collision."""
-    s = 1.0 + 2.0 * EDGE_CLEARANCE / min(DIE_X, DIE_Y)
+    s = 1.0 + 2.0 * LAND_KEEPOUT_GAP / min(KEEP_OUT_WIDTH, KEEP_OUT_HEIGHT)
     for side, pads in sides.items():
         if not pads:
             continue
-        need = (len(pads) - 1) * PROBE_PAD_PITCH + PROBE_PAD_SIDE
-        die_dim = DIE_X if side in ("T", "B") else DIE_Y
-        s = max(s, need / die_dim)
+        need = (len(pads) - 1) * STAGGER_STEP + PROBE_PAD_SIDE
+        ko_dim = KEEP_OUT_WIDTH if side in ("T", "B") else KEEP_OUT_HEIGHT
+        s = max(s, need / ko_dim)
     return s
 
 
 def place_probes(sides, cx, cy, scale):
-    """Return probe land dicts: {x, y, side, id, die}."""
-    half_ax = scale * DIE_X / 2.0
-    half_ay = scale * DIE_Y / 2.0
+    half_ax = scale * KEEP_OUT_WIDTH / 2.0
+    half_ay = scale * KEEP_OUT_HEIGHT / 2.0
     probes = []
     for side, pads in sides.items():
         if not pads:
             continue
         if side in ("T", "B"):
             pads = sorted(pads, key=lambda p: p["x"])
-            xs = pava_min_pitch([p["x"] for p in pads], PROBE_PAD_PITCH)
-            y = cy + half_ay if side == "T" else cy - half_ay
-            coords = [(x, y) for x in xs]
+            us = pava_min_pitch([p["x"] for p in pads], STAGGER_STEP)
         else:
             pads = sorted(pads, key=lambda p: p["y"])
-            ys = pava_min_pitch([p["y"] for p in pads], PROBE_PAD_PITCH)
-            x = cx + half_ax if side == "R" else cx - half_ax
-            coords = [(x, yy) for yy in ys]
-        for i, (p, (x, y)) in enumerate(zip(pads, coords), start=1):
-            probes.append({"x": x, "y": y, "side": side,
-                           "id": f"{side}{i}", "die": p})
+            us = pava_min_pitch([p["y"] for p in pads], STAGGER_STEP)
+        for i, (p, u) in enumerate(zip(pads, us)):
+            row = i % LAND_ROWS
+            if side == "T":
+                x, y = u, cy + half_ay + row * ROW_GAP
+            elif side == "B":
+                x, y = u, cy - half_ay - row * ROW_GAP
+            elif side == "R":
+                x, y = cx + half_ax + row * ROW_GAP, u
+            else:
+                x, y = cx - half_ax - row * ROW_GAP, u
+            probes.append({"x": x, "y": y, "side": side, "row": row,
+                           "id": f"{side}{i + 1}", "die": p})
     return probes
 
 
 def compute_layout(pads):
-    # translate all pads so the die/board centre sits at BOARD_CENTER
     cx0, cy0 = die_center(pads)
     dx, dy = BOARD_CENTER[0] - cx0, BOARD_CENTER[1] - cy0
     for p in pads:
@@ -202,148 +160,21 @@ def compute_layout(pads):
 
 
 def aperture_radius():
-    """Circular aperture radius: 1 cm beyond the die's nearest point to the
-    circle -- i.e. the die corner (half-diagonal), which is the closest the
-    die gets to a circle centred on it."""
     return math.hypot(DIE_X / 2.0, DIE_Y / 2.0) + APERTURE_CLEARANCE
 
 
 def marker_dims():
-    """A rectangle with the die's aspect ratio, scaled so the die is >= 15 mm
-    inside it on every side (the smaller dimension is the binding one)."""
-    s = 1.0 + 2.0 * MARKER_CLEARANCE / min(DIE_X, DIE_Y)
-    return s * DIE_X, s * DIE_Y
-
-
-# ----------------------------------------------------------------------------
-# kicad primitives (um in, mm out)
-# ----------------------------------------------------------------------------
-def rect(cx, cy, w, h, layer, filled=False):
-    r = bt.BoardRectangle()
-    r.top_left = Vector2.from_xy_mm((cx - w / 2.0) / 1000.0, (cy + h / 2.0) / 1000.0)
-    r.bottom_right = Vector2.from_xy_mm((cx + w / 2.0) / 1000.0, (cy - h / 2.0) / 1000.0)
-    r.layer = bt.BoardLayer.Value(layer)
-    r.attributes.fill.filled = filled
-    return r
-
-
-def square(cx, cy, side, layer, filled=False):
-    return rect(cx, cy, side, side, layer, filled)
-
-
-def circle(cx, cy, radius, layer, filled=False):
-    c = bt.BoardCircle()
-    c.center = Vector2.from_xy_mm(cx / 1000.0, cy / 1000.0)
-    c.radius_point = Vector2.from_xy_mm((cx + radius) / 1000.0, cy / 1000.0)
-    c.layer = bt.BoardLayer.Value(layer)
-    c.attributes.fill.filled = filled
-    return c
-
-
-def via_land(x, y):
-    """An SMD-pad-with-via land: a solid 1000 um copper disc on F.Cu (the SMD
-    solder pad) with a 0.02" plated through-hole in it (the via, for the
-    top-side signal tap), and soldermask openings on both sides."""
-    v = bt.Via()
-    v.position = Vector2.from_xy_mm(x / 1000.0, y / 1000.0)
-    v.diameter = int(PROBE_PAD_SIDE * 1000)     # nm
-    v.drill_diameter = int(VIA_DRILL * 1000)    # nm
-    v.type = bt.ViaType.VT_THROUGH
-    mask_r = PROBE_PAD_SIDE / 2.0 + MASK_EXPAND
-    return [v,
-            circle(x, y, PROBE_PAD_SIDE / 2.0, LAYER_F_CU, filled=True),  # SMD pad
-            circle(x, y, mask_r, LAYER_F_MASK, filled=True),
-            circle(x, y, mask_r, LAYER_B_MASK, filled=True)]
-
-
-def probe_wire(pr):
-    """A line from a landing pad to the die pad it probes -- a visual stand-in
-    for the probe needle. On a documentation layer, NOT fabricated."""
-    d = pr["die"]
-    s = bt.BoardSegment()
-    s.start = Vector2.from_xy_mm(pr["x"] / 1000.0, pr["y"] / 1000.0)
-    s.end = Vector2.from_xy_mm(d["x"] / 1000.0, d["y"] / 1000.0)
-    s.layer = bt.BoardLayer.Value(LAYER_PROBE)
-    s.width = int(PROBE_WIRE_WIDTH * 1000)
-    return s
-
-
-def signal_label(x, y, side, text):
-    """A silkscreen label placed just outside a land, running radially outward
-    (vertical on top/bottom, horizontal on left/right) so labels don't collide
-    at the land pitch."""
-    off = PROBE_PAD_SIDE / 2.0 + LABEL_GAP
-    # KiCad text extends: angle 90 -> HA_LEFT=down, HA_RIGHT=up;
-    #                     angle 0  -> HA_LEFT=right, HA_RIGHT=left.
-    # Pick the alignment that makes each label read radially outward.
-    if side == "T":
-        pos, angle, ha = (x, y + off), 90.0, "HA_RIGHT"
-    elif side == "B":
-        pos, angle, ha = (x, y - off), 90.0, "HA_LEFT"
-    elif side == "L":
-        pos, angle, ha = (x - off, y), 0.0, "HA_RIGHT"
-    else:  # R
-        pos, angle, ha = (x + off, y), 0.0, "HA_LEFT"
-    t = bt.BoardText()
-    t.value = text
-    t.position = Vector2.from_xy_mm(pos[0] / 1000.0, pos[1] / 1000.0)
-    t.layer = bt.BoardLayer.Value(LAYER_F_SILK)
-    a = t.attributes
-    a.size = Vector2.from_xy_mm(LABEL_SIZE / 1000.0, LABEL_SIZE / 1000.0)
-    a.stroke_width = int(LABEL_THICK * 1000)
-    a.angle = angle
-    a.keep_upright = False
-    a.horizontal_alignment = ct.HorizontalAlignment.Value(ha)
-    a.vertical_alignment = ct.VerticalAlignment.Value("VA_CENTER")
-    return t
-
-
-def clear_board(board):
-    for getter in ("get_shapes", "get_vias", "get_footprints"):
-        try:
-            items = getattr(board, getter)()
-            if items:
-                board.remove_items(items)
-        except Exception:
-            pass
-
-
-# ----------------------------------------------------------------------------
-# builders
-# ----------------------------------------------------------------------------
-def build_fab(board, pads, L):
-    """Manufacturable board: outline + aperture cutout + solderable via-lands."""
-    cx, cy, scale = L["cx"], L["cy"], L["scale"]
-    clear_board(board)
-    items = []
-    # board outline (square) + circular aperture cutout (both Edge.Cuts)
-    items.append(rect(cx, cy, CARD_SIZE, CARD_SIZE, LAYER_EDGE))
-    items.append(circle(cx, cy, aperture_radius(), LAYER_EDGE))
-    # non-fabricated die-aspect clearance marker rectangle
-    mw, mh = marker_dims()
-    items.append(rect(cx, cy, mw, mh, LAYER_MARKER))
-    # reference-only die + die pads (not fabricated)
-    items.append(rect(cx, cy, DIE_X, DIE_Y, LAYER_REF))
-    for p in pads:
-        items.append(square(p["x"], p["y"], DIE_PAD_SIDE, LAYER_REF))
-    # solderable SMD-pad-with-via lands + silkscreen signal labels + probe wires
-    for pr in L["probes"]:
-        items.extend(via_land(pr["x"], pr["y"]))
-        items.append(signal_label(pr["x"], pr["y"], pr["side"],
-                                   pr["die"]["signal"] or pr["id"]))
-        items.append(probe_wire(pr))
-    board.create_items(items)
-    check_fit(L)
+    return KEEP_OUT_WIDTH, KEEP_OUT_HEIGHT
 
 
 def check_fit(L):
-    """Warn if any land+mask leaves the card, or the copper frame is thin."""
     cx, cy = L["cx"], L["cy"]
-    half = CARD_SIZE / 2.0
-    mask_r = PROBE_PAD_SIDE / 2.0 + MASK_EXPAND
-    worst = min(min(half - abs(pr["x"] - cx), half - abs(pr["y"] - cy))
-                for pr in L["probes"]) - mask_r
-    frame_lr = half - (L["scale"] * DIE_X / 2.0)  # card edge to left/right lands
+    half_w = BOARD_WIDTH / 2.0
+    half_h = BOARD_HEIGHT / 2.0
+    edge = PROBE_PAD_SIDE / 2.0
+    worst = min(min(half_w - abs(pr["x"] - cx), half_h - abs(pr["y"] - cy))
+                for pr in L["probes"]) - edge
+    frame_lr = half_w - (L["scale"] * KEEP_OUT_WIDTH / 2.0)
     if worst < 0:
         print(f"  WARNING: lands extend {-worst:.0f} um past the card outline.")
     else:
@@ -351,60 +182,48 @@ def check_fit(L):
     print(f"  Left/right copper frame width ~ {frame_lr - PROBE_PAD_SIDE/2:.0f} um.")
 
 
-# ----------------------------------------------------------------------------
-# outputs
-# ----------------------------------------------------------------------------
 def _altium_label(pr):
-    """Anchor (mm), rotation (deg) and text for an Altium silk label, placed so
-    it reads radially outward. Altium stroke text is anchored bottom-left and
-    extends up/right, so left/bottom labels are shifted by an estimated length."""
-    off = (PROBE_PAD_SIDE / 2.0 + LABEL_GAP + 250) / 1000.0
+    off = ((LAND_ROWS - 1 - pr["row"]) * ROW_GAP
+           + PROBE_PAD_SIDE / 2.0 + LABEL_GAP) / 1000.0
     h = LABEL_SIZE / 1000.0
     x, y = pr["x"] / 1000.0, pr["y"] / 1000.0
     sig = pr["die"]["signal"] or pr["id"]
-    # over-estimate the rendered length so bottom/left labels (anchored at their
-    # far end) keep their NEAR end clear of the pad instead of overrunning it.
     ln = max(1, len(sig)) * h * 1.1
-    if pr["side"] == "T":
+    side = pr["side"]
+    if side == "T":
         return (x - h / 2, y + off, 90.0, sig)
-    if pr["side"] == "B":
+    if side == "B":
         return (x - h / 2, y - off - ln, 90.0, sig)
-    if pr["side"] == "L":
-        return (x - off - ln, y - h / 2, 0.0, sig)
-    return (x + off, y - h / 2, 0.0, sig)  # R
+    if side == "R":
+        return (x + off, y - h / 2, 0.0, sig)
+    return (x - off - ln, y - h / 2, 0.0, sig)
 
 
 def _pas_str(s):
     return "'" + s.replace("'", "''") + "'"
 
 
-def write_altium_script(path, pads, L):
-    """Emit a self-contained Altium DelphiScript (.pas). Run it in Altium
-    Designer (File > Run Script..., choose GenerateProbeCard) to build a PCB
-    equivalent to the manufacturable KiCad board: 4.5" outline, aperture cutout,
-    round through-hole solder lands (1000 um pad, 0.02" plated hole) with silk
-    signal labels, and reference die/die-pads/probe-wires on a mech layer."""
-    cx, cy, scale = L["cx"], L["cy"], L["scale"]
-    H = CARD_SIZE / 2.0
-    APR = aperture_radius()          # circular aperture radius (um)
-    MW, MH = marker_dims()           # marker rectangle size (um)
+def write_altium_script(path, L):
+    cx, cy = L["cx"], L["cy"]
+    HW = BOARD_WIDTH / 2.0
+    HH = BOARD_HEIGHT / 2.0
+    APR = aperture_radius()
+    MW, MH = marker_dims()
     PAD = PROBE_PAD_SIDE / 1000.0
     HOLE = VIA_DRILL / 1000.0
     TEXTH = LABEL_SIZE / 1000.0
     TEXTW = LABEL_THICK / 1000.0
     PROBEW = PROBE_WIRE_WIDTH / 1000.0
     DIEPAD = DIE_PAD_SIDE / 1000.0
-    pcbdoc = str(path.with_suffix(".PcbDoc"))
 
     def mm(v):
         return f"{v:.4f}"
 
     o = []
     w = o.append
-    # ---- header + helpers (// comments so no { } clash) ----
     w(f"""// Auto-generated by auto_probe_pcb.py -- Altium DelphiScript.
 // In Altium Designer: File > Run Script..., then run GenerateProbeCard.
-// Builds a PCB equivalent to the KiCad probe-card board.
+// Builds the probe-card PCB.
 
 Var
     Board : IPCB_Board;
@@ -460,31 +279,12 @@ Begin
     RegisterObj(Tr);
 End;
 
-Procedure AddOutlineTrack(X1, Y1, X2, Y2, Wid : Double);
-Var Tr;
-Begin
-    Tr := PCBServer.PCBObjectFactory(eTrackObject, eNoDimension, eCreate_Default);
-    Tr.X1 := MMsToCoord(X1); Tr.Y1 := MMsToCoord(Y1);
-    Tr.X2 := MMsToCoord(X2); Tr.Y2 := MMsToCoord(Y2);
-    Tr.Width := MMsToCoord(Wid);
-    Tr.Layer := {ALTIUM_OUTLINE_LAYER};
-    RegisterObj(Tr);
-End;
-
 Procedure AddRefRect(X1, Y1, X2, Y2, Wid : Double);
 Begin
     AddRefTrack(X1, Y1, X2, Y1, Wid);
     AddRefTrack(X2, Y1, X2, Y2, Wid);
     AddRefTrack(X2, Y2, X1, Y2, Wid);
     AddRefTrack(X1, Y2, X1, Y1, Wid);
-End;
-
-Procedure AddOutlineRect(X1, Y1, X2, Y2, Wid : Double);
-Begin
-    AddOutlineTrack(X1, Y1, X2, Y1, Wid);
-    AddOutlineTrack(X2, Y1, X2, Y2, Wid);
-    AddOutlineTrack(X2, Y2, X1, Y2, Wid);
-    AddOutlineTrack(X1, Y2, X1, Y1, Wid);
 End;
 
 Procedure AddDiePad(XMM, YMM : Double);
@@ -499,45 +299,46 @@ Begin
     AddRefTrack(X1, Y1, X2, Y2, {mm(PROBEW)});
 End;
 
-// --- board shape: rectangular outline. Standard resize-outline pattern;
-// --- may need tweaking per Altium version.
+// --- everything belonging to one probe: the solder land, its silk label,
+// --- the die pad it probes, and the probe needle between them.
+Procedure EmitLand(LX, LY : Double; Desig : String;
+                   TX, TY, Rot : Double; Sig : String; DX, DY : Double);
+Begin
+    AddLand(LX, LY, Desig);
+    AddText(TX, TY, Rot, Sig);
+    AddDiePad(DX, DY);
+    AddProbe(LX, LY, DX, DY);
+End;
+
+// --- board shape: rectangular outline.
+// --- Segments[i] returns the record BY VALUE, so "Segments[i].vx := ..."
+// --- edits a throwaway copy and does nothing. Build a local TPolySegment
+// --- and assign it back into Segments[i].
+Procedure SetOutlinePoint(Idx : Integer; XMM, YMM : Double);
+Var Seg : TPolySegment;
+Begin
+    Seg := Board.BoardOutline.Segments[Idx];
+    Seg.Kind := ePolySegmentLine;
+    Seg.vx := MMsToCoord(XMM);
+    Seg.vy := MMsToCoord(YMM);
+    Board.BoardOutline.Segments[Idx] := Seg;
+End;
+
 Procedure SetRectBoard(X1, Y1, X2, Y2 : Double);
 Begin
     Board.BoardOutline.Invalidate;
     Board.BoardOutline.PointCount := 4;
-    Board.BoardOutline.Segments[0].Kind := ePolySegmentLine;
-    Board.BoardOutline.Segments[0].vx := MMsToCoord(X1);
-    Board.BoardOutline.Segments[0].vy := MMsToCoord(Y1);
-    Board.BoardOutline.Segments[1].Kind := ePolySegmentLine;
-    Board.BoardOutline.Segments[1].vx := MMsToCoord(X2);
-    Board.BoardOutline.Segments[1].vy := MMsToCoord(Y1);
-    Board.BoardOutline.Segments[2].Kind := ePolySegmentLine;
-    Board.BoardOutline.Segments[2].vx := MMsToCoord(X2);
-    Board.BoardOutline.Segments[2].vy := MMsToCoord(Y2);
-    Board.BoardOutline.Segments[3].Kind := ePolySegmentLine;
-    Board.BoardOutline.Segments[3].vx := MMsToCoord(X1);
-    Board.BoardOutline.Segments[3].vy := MMsToCoord(Y2);
+    SetOutlinePoint(0, X1, Y1);
+    SetOutlinePoint(1, X2, Y1);
+    SetOutlinePoint(2, X2, Y2);
+    SetOutlinePoint(3, X1, Y2);
     Board.BoardOutline.Validate;
-End;
-
-// --- aperture: a board-cutout region. Region-contour API is the part most
-// --- likely to need adjustment for your Altium version.
-Procedure AddCutout(X1, Y1, X2, Y2 : Double);
-Var Rgn, C;
-Begin
-    Rgn := PCBServer.PCBObjectFactory(eRegionObject, eNoDimension, eCreate_Default);
-    Rgn.SetState_Kind(eRegionKind_BoardCutout);
-    C := PCBServer.PCBContourFactory;
-    C.AddPoint(MMsToCoord(X1), MMsToCoord(Y1));
-    C.AddPoint(MMsToCoord(X2), MMsToCoord(Y1));
-    C.AddPoint(MMsToCoord(X2), MMsToCoord(Y2));
-    C.AddPoint(MMsToCoord(X1), MMsToCoord(Y2));
-    Rgn.SetOutlineContour(C);
-    Rgn.Layer := eTopLayer;
-    RegisterObj(Rgn);
+    Board.ViewManager_FullUpdate;
 End;
 
 // --- circular aperture: board-cutout region approximated by a 72-gon.
+// --- The region-contour API is the part most likely to need adjustment
+// --- for your Altium version.
 Procedure AddCircleCutout(CXmm, CYmm, Rmm : Double);
 Var Rgn, C, i, ang;
 Begin
@@ -575,31 +376,15 @@ Begin
 End;
 """)
 
-    # ---- data procedures ----
-    w("Procedure BuildLands;\nBegin")
-    for pr in L["probes"]:
-        w(f"    AddLand({mm(pr['x']/1000)}, {mm(pr['y']/1000)}, {_pas_str(pr['id'])});")
-    w("End;\n")
-
-    w("Procedure BuildLabels;\nBegin")
-    for pr in L["probes"]:
-        lx, ly, rot, sig = _altium_label(pr)
-        w(f"    AddText({mm(lx)}, {mm(ly)}, {mm(rot)}, {_pas_str(sig)});")
-    w("End;\n")
-
-    w("Procedure BuildDiePads;\nBegin")
-    for p in pads:
-        w(f"    AddDiePad({mm(p['x']/1000)}, {mm(p['y']/1000)});")
-    w("End;\n")
-
-    w("Procedure BuildProbes;\nBegin")
+    w("Procedure BuildAll;\nBegin")
     for pr in L["probes"]:
         d = pr["die"]
-        w(f"    AddProbe({mm(pr['x']/1000)}, {mm(pr['y']/1000)}, "
+        lx, ly, rot, sig = _altium_label(pr)
+        w(f"    EmitLand({mm(pr['x']/1000)}, {mm(pr['y']/1000)}, {_pas_str(pr['id'])}, "
+          f"{mm(lx)}, {mm(ly)}, {mm(rot)}, {_pas_str(sig)}, "
           f"{mm(d['x']/1000)}, {mm(d['y']/1000)});")
     w("End;\n")
 
-    # ---- entry point ----
     w(f"""Procedure GenerateProbeCard;
 Begin
     If PCBServer = Nil Then
@@ -615,14 +400,11 @@ Begin
         Exit;
     End;
     PCBServer.PreProcess;
-    SetRectBoard({mm((cx-H)/1000)}, {mm((cy-H)/1000)}, {mm((cx+H)/1000)}, {mm((cy+H)/1000)});
+    SetRectBoard({mm((cx-HW)/1000)}, {mm((cy-HH)/1000)}, {mm((cx+HW)/1000)}, {mm((cy+HH)/1000)});
     AddCircleCutout({mm(cx/1000)}, {mm(cy/1000)}, {mm(APR/1000)});
     AddMarkerRect({mm((cx-MW/2)/1000)}, {mm((cy-MH/2)/1000)}, {mm((cx+MW/2)/1000)}, {mm((cy+MH/2)/1000)}, {mm(MARKER_LINE/1000)});
     AddRefRect({mm((cx-DIE_X/2)/1000)}, {mm((cy-DIE_Y/2)/1000)}, {mm((cx+DIE_X/2)/1000)}, {mm((cy+DIE_Y/2)/1000)}, 0.05);
-    BuildDiePads;
-    BuildLands;
-    BuildLabels;
-    BuildProbes;
+    BuildAll;
     PCBServer.PostProcess;
     Board.ViewManager_FullUpdate;
     Client.SendMessage('PCB:Zoom', 'Action=Redraw', 255, Client.CurrentView);
@@ -638,11 +420,11 @@ End;
 def write_wiring_map(path, L):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["land_id", "side", "signal", "die_pad",
+        w.writerow(["land_id", "side", "row", "signal", "die_pad",
                     "land_x_mm", "land_y_mm", "die_x_um", "die_y_um"])
         for pr in L["probes"]:
             d = pr["die"]
-            w.writerow([pr["id"], pr["side"], d["signal"], d["name"],
+            w.writerow([pr["id"], pr["side"], pr["row"], d["signal"], d["name"],
                         f"{pr['x']/1000:.3f}", f"{pr['y']/1000:.3f}",
                         f"{d['x']:.3f}", f"{d['y']:.3f}"])
 
@@ -666,33 +448,29 @@ def main():
     counts = {s: len(v) for s, v in L["sides"].items()}
     print(f"Die {DIE_X} x {DIE_Y} um, centre ({L['cx']:.1f}, {L['cy']:.1f})")
     print(f"Per-side pad counts: {counts}")
-    print(f"Aperture scale x{L['scale']:.2f} -> "
-          f"{L['scale']*DIE_X/1000:.1f} x {L['scale']*DIE_Y/1000:.1f} mm")
+    print(f"Land ring = keep-out x{L['scale']:.2f} -> "
+          f"{L['scale']*KEEP_OUT_WIDTH/1000:.1f} x "
+          f"{L['scale']*KEEP_OUT_HEIGHT/1000:.1f} mm")
+    MW, MH = marker_dims()
+    print(f"Keep-out {MW/1000:.1f} x {MH/1000:.1f} mm; inner-row land clears it by "
+          f"X {L['scale']*KEEP_OUT_WIDTH/2 - MW/2:.0f} um, "
+          f"Y {L['scale']*KEEP_OUT_HEIGHT/2 - MH/2:.0f} um")
+    apr = aperture_radius()
+    if min(MW, MH) / 2.0 < apr:
+        print(f"  WARNING: keep-out half-extent {min(MW, MH)/2:.0f} um is inside the "
+              f"{apr:.0f} um aperture radius -- the marker crosses the cutout.")
+    check_fit(L)
 
-    # --- outputs that DON'T need KiCad (always produced) ---
     map_path = OUTPUT_DIR / f"{csv_path.stem}_wiring_map.csv"
     write_wiring_map(map_path, L)
     print(f"Wrote wiring map:   {map_path}")
 
     pas_path = OUTPUT_DIR / f"{csv_path.stem}_probe_card.pas"
-    write_altium_script(pas_path, pads, L)
+    write_altium_script(pas_path, L)
     print(f"Wrote Altium script:{pas_path}")
 
     print(f"{len(pads)} die pads / {len(L['probes'])} probe lands "
           f"({VIA_DRILL} um dia drill, {PROBE_PAD_SIDE} um land).")
-
-    # --- outputs that DO need a running KiCad (IPC API) ---
-    try:
-        board = KiCad().get_board()
-    except Exception as e:
-        print(f"\nKiCad not reachable -- skipped .kicad_pcb outputs "
-              f"(open a board in KiCad and rerun). Details: {e}")
-        return
-
-    build_fab(board, pads, L)
-    fab_path = OUTPUT_DIR / f"{csv_path.stem}_probe_card.kicad_pcb"
-    board.save_as(str(fab_path), overwrite=True)
-    print(f"Wrote fab board:    {fab_path}")
 
 
 if __name__ == "__main__":
