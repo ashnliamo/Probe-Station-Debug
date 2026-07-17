@@ -40,7 +40,7 @@ ALTIUM_MARKER_LAYER  = "eMechanical15"
 ALTIUM_REF_LAYER     = "eMechanical13"
 
 
-def read_pads(csv_path):
+def read_pads(csv_path): # parsing the inputted CSV
     with open(csv_path, newline="") as f:
         rows = list(csv.reader(f))
     header_idx = None
@@ -68,25 +68,23 @@ def read_pads(csv_path):
     return pads
 
 
-def die_center(pads):
+def die_center(pads): # finds the center of the die based on the pads
     xs = [p["x"] for p in pads]
     ys = [p["y"] for p in pads]
     return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
 
 
-def classify_side(pad, cx, cy):
-    nx = (pad["x"] - cx) / (DIE_X / 2.0)
-    ny = (pad["y"] - cy) / (DIE_Y / 2.0)
-    if abs(nx) >= abs(ny):
-        return "R" if nx > 0 else "L"
-    return "T" if ny > 0 else "B"
-
-
-def group_by_side(pads, cx, cy):
-    sides = {"T": [], "B": [], "L": [], "R": []}
+def group_by_edge(pads, cx, cy): # classifies each pad into top, bottom, left, or right and groups them
+    edges = {"T": [], "B": [], "L": [], "R": []}
     for p in pads:
-        sides[classify_side(p, cx, cy)].append(p)
-    return sides
+        nx = (p["x"] - cx) / (DIE_X / 2.0)
+        ny = (p["y"] - cy) / (DIE_Y / 2.0)
+        if abs(nx) >= abs(ny):
+            edge = "R" if nx > 0 else "L"
+        else:
+            edge = "T" if ny > 0 else "B"
+        edges[edge].append(p)
+    return edges
 
 
 def pava_min_pitch(targets, pitch):
@@ -107,25 +105,25 @@ def pava_min_pitch(targets, pitch):
     return [z[i] + i * pitch for i in range(n)]
 
 
-def required_scale(sides):
+def required_scale(edges):
     s = 1.0 + 2.0 * LAND_KEEPOUT_GAP / min(KEEP_OUT_WIDTH, KEEP_OUT_HEIGHT)
-    for side, pads in sides.items():
+    for edge, pads in edges.items():
         if not pads:
             continue
         need = (len(pads) - 1) * STAGGER_STEP + PROBE_PAD_SIDE
-        ko_dim = KEEP_OUT_WIDTH if side in ("T", "B") else KEEP_OUT_HEIGHT
+        ko_dim = KEEP_OUT_WIDTH if edge in ("T", "B") else KEEP_OUT_HEIGHT
         s = max(s, need / ko_dim)
     return s
 
 
-def place_probes(sides, cx, cy, scale):
+def place_probes(edges, cx, cy, scale):
     half_ax = scale * KEEP_OUT_WIDTH / 2.0
     half_ay = scale * KEEP_OUT_HEIGHT / 2.0
     probes = []
-    for side, pads in sides.items():
+    for edge, pads in edges.items():
         if not pads:
             continue
-        if side in ("T", "B"):
+        if edge in ("T", "B"):
             pads = sorted(pads, key=lambda p: p["x"])
             us = pava_min_pitch([p["x"] for p in pads], STAGGER_STEP)
         else:
@@ -133,16 +131,16 @@ def place_probes(sides, cx, cy, scale):
             us = pava_min_pitch([p["y"] for p in pads], STAGGER_STEP)
         for i, (p, u) in enumerate(zip(pads, us)):
             row = i % LAND_ROWS
-            if side == "T":
+            if edge == "T":
                 x, y = u, cy + half_ay + row * ROW_GAP
-            elif side == "B":
+            elif edge == "B":
                 x, y = u, cy - half_ay - row * ROW_GAP
-            elif side == "R":
+            elif edge == "R":
                 x, y = cx + half_ax + row * ROW_GAP, u
             else:
                 x, y = cx - half_ax - row * ROW_GAP, u
-            probes.append({"x": x, "y": y, "side": side, "row": row,
-                           "id": f"{side}{i + 1}", "die": p})
+            probes.append({"x": x, "y": y, "edge": edge, "row": row,
+                           "id": f"{edge}{i + 1}", "die": p})
     return probes
 
 
@@ -153,10 +151,10 @@ def compute_layout(pads):
         p["x"] += dx
         p["y"] += dy
     cx, cy = die_center(pads)
-    sides = group_by_side(pads, cx, cy)
-    scale = required_scale(sides)
-    probes = place_probes(sides, cx, cy, scale)
-    return {"cx": cx, "cy": cy, "sides": sides, "scale": scale, "probes": probes}
+    edges = group_by_edge(pads, cx, cy)
+    scale = required_scale(edges)
+    probes = place_probes(edges, cx, cy, scale)
+    return {"cx": cx, "cy": cy, "edges": edges, "scale": scale, "probes": probes}
 
 
 def aperture_radius():
@@ -171,9 +169,9 @@ def check_fit(L):
     cx, cy = L["cx"], L["cy"]
     half_w = BOARD_WIDTH / 2.0
     half_h = BOARD_HEIGHT / 2.0
-    edge = PROBE_PAD_SIDE / 2.0
+    pad_half = PROBE_PAD_SIDE / 2.0
     worst = min(min(half_w - abs(pr["x"] - cx), half_h - abs(pr["y"] - cy))
-                for pr in L["probes"]) - edge
+                for pr in L["probes"]) - pad_half
     frame_lr = half_w - (L["scale"] * KEEP_OUT_WIDTH / 2.0)
     if worst < 0:
         print(f"  WARNING: lands extend {-worst:.0f} um past the card outline.")
@@ -189,12 +187,12 @@ def _altium_label(pr):
     x, y = pr["x"] / 1000.0, pr["y"] / 1000.0
     sig = pr["die"]["signal"] or pr["id"]
     ln = max(1, len(sig)) * h * 1.1
-    side = pr["side"]
-    if side == "T":
+    edge = pr["edge"]
+    if edge == "T":
         return (x - h / 2, y + off, 90.0, sig)
-    if side == "B":
+    if edge == "B":
         return (x - h / 2, y - off - ln, 90.0, sig)
-    if side == "R":
+    if edge == "R":
         return (x + off, y - h / 2, 0.0, sig)
     return (x - off - ln, y - h / 2, 0.0, sig)
 
@@ -214,7 +212,6 @@ def write_altium_script(path, L):
     TEXTH = LABEL_SIZE / 1000.0
     TEXTW = LABEL_THICK / 1000.0
     PROBEW = PROBE_WIRE_WIDTH / 1000.0
-    DIEPAD = DIE_PAD_SIDE / 1000.0
 
     def mm(v):
         return f"{v:.4f}"
@@ -279,34 +276,18 @@ Begin
     RegisterObj(Tr);
 End;
 
-Procedure AddRefRect(X1, Y1, X2, Y2, Wid : Double);
-Begin
-    AddRefTrack(X1, Y1, X2, Y1, Wid);
-    AddRefTrack(X2, Y1, X2, Y2, Wid);
-    AddRefTrack(X2, Y2, X1, Y2, Wid);
-    AddRefTrack(X1, Y2, X1, Y1, Wid);
-End;
-
-Procedure AddDiePad(XMM, YMM : Double);
-Var Hf;
-Begin
-    Hf := {mm(DIEPAD / 2.0)};
-    AddRefRect(XMM - Hf, YMM - Hf, XMM + Hf, YMM + Hf, 0.02);
-End;
-
 Procedure AddProbe(X1, Y1, X2, Y2 : Double);
 Begin
     AddRefTrack(X1, Y1, X2, Y2, {mm(PROBEW)});
 End;
 
 // --- everything belonging to one probe: the solder land, its silk label,
-// --- the die pad it probes, and the probe needle between them.
+// --- and the probe needle running from the land to the die-pad coordinate.
 Procedure EmitLand(LX, LY : Double; Desig : String;
                    TX, TY, Rot : Double; Sig : String; DX, DY : Double);
 Begin
     AddLand(LX, LY, Desig);
     AddText(TX, TY, Rot, Sig);
-    AddDiePad(DX, DY);
     AddProbe(LX, LY, DX, DY);
 End;
 
@@ -374,6 +355,23 @@ Begin
     AddMarkerTrack(X2, Y2, X1, Y2, Wid);
     AddMarkerTrack(X1, Y2, X1, Y1, Wid);
 End;
+
+// --- turn off mechanical layers this script never draws on (only M13 and
+// --- M15 are used). Wrapped in Try/Except because the layer-enable API
+// --- differs across Altium versions; UNVERIFIED. The copper, paste, solder,
+// --- overlay, keep-out, drill and multi-layer layers are intrinsic and
+// --- cannot be deleted -- at most hidden -- so they are left alone.
+Procedure DisableUnusedMechLayers;
+Begin
+    Try
+        Board.LayerStack_V7.LayerObject_V7[eMechanical1].MechanicalLayerEnabled := False;
+    Except
+        Try
+            Board.MechanicalLayerEnabled[eMechanical1] := False;
+        Except
+        End;
+    End;
+End;
 """)
 
     w("Procedure BuildAll;\nBegin")
@@ -400,10 +398,10 @@ Begin
         Exit;
     End;
     PCBServer.PreProcess;
+    DisableUnusedMechLayers;
     SetRectBoard({mm((cx-HW)/1000)}, {mm((cy-HH)/1000)}, {mm((cx+HW)/1000)}, {mm((cy+HH)/1000)});
     AddCircleCutout({mm(cx/1000)}, {mm(cy/1000)}, {mm(APR/1000)});
     AddMarkerRect({mm((cx-MW/2)/1000)}, {mm((cy-MH/2)/1000)}, {mm((cx+MW/2)/1000)}, {mm((cy+MH/2)/1000)}, {mm(MARKER_LINE/1000)});
-    AddRefRect({mm((cx-DIE_X/2)/1000)}, {mm((cy-DIE_Y/2)/1000)}, {mm((cx+DIE_X/2)/1000)}, {mm((cy+DIE_Y/2)/1000)}, 0.05);
     BuildAll;
     PCBServer.PostProcess;
     Board.ViewManager_FullUpdate;
@@ -420,11 +418,11 @@ End;
 def write_wiring_map(path, L):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["land_id", "side", "row", "signal", "die_pad",
+        w.writerow(["land_id", "edge", "row", "signal", "die_pad",
                     "land_x_mm", "land_y_mm", "die_x_um", "die_y_um"])
         for pr in L["probes"]:
             d = pr["die"]
-            w.writerow([pr["id"], pr["side"], pr["row"], d["signal"], d["name"],
+            w.writerow([pr["id"], pr["edge"], pr["row"], d["signal"], d["name"],
                         f"{pr['x']/1000:.3f}", f"{pr['y']/1000:.3f}",
                         f"{d['x']:.3f}", f"{d['y']:.3f}"])
 
@@ -445,9 +443,9 @@ def main():
     L = compute_layout(pads)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    counts = {s: len(v) for s, v in L["sides"].items()}
+    counts = {e: len(v) for e, v in L["edges"].items()}
     print(f"Die {DIE_X} x {DIE_Y} um, centre ({L['cx']:.1f}, {L['cy']:.1f})")
-    print(f"Per-side pad counts: {counts}")
+    print(f"Per-edge pad counts: {counts}")
     print(f"Land ring = keep-out x{L['scale']:.2f} -> "
           f"{L['scale']*KEEP_OUT_WIDTH/1000:.1f} x "
           f"{L['scale']*KEEP_OUT_HEIGHT/1000:.1f} mm")
