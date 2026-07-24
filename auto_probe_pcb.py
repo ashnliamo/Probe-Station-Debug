@@ -6,6 +6,8 @@ HERE = pathlib.Path(__file__).parent
 INPUT_DIR = HERE / "auto_probe_pcb_inputs"
 OUTPUT_DIR = HERE / "auto_probe_pcb_outputs"
 COL_PAD, COL_SIGNAL, COL_X, COL_Y = ("pad", "signal", "x (um)", "y (um)")
+COL_NETCLASS = "net class"
+UNCLASSIFIED = "UNCLASSIFIED"
 
 DIE_X = 8170.73
 DIE_Y = 5155.584
@@ -39,6 +41,11 @@ MARKER_LINE = 150
 ALTIUM_MARKER_LAYER  = "eMechanical15"
 ALTIUM_REF_LAYER     = "eMechanical13"
 
+# --- schematic (net-class bus blocks), all in mils ---
+SCH_PIN_PITCH = 100
+SCH_PIN_LENGTH = 300
+SCH_BLOCK_WIDTH = 1200
+
 
 def read_pads(csv_path): # parsing the inputted CSV
     with open(csv_path, newline="") as f:
@@ -54,6 +61,7 @@ def read_pads(csv_path): # parsing the inputted CSV
     ix, iy = header.index(COL_X), header.index(COL_Y)
     ipad = header.index(COL_PAD) if COL_PAD in header else None
     isig = header.index(COL_SIGNAL) if COL_SIGNAL in header else None
+    inet = header.index(COL_NETCLASS) if COL_NETCLASS in header else None
     pads = []
     for row in rows[header_idx + 1:]:
         if len(row) <= max(ix, iy):
@@ -64,7 +72,9 @@ def read_pads(csv_path): # parsing the inputted CSV
             continue
         name = row[ipad].strip() if ipad is not None and ipad < len(row) else ""
         signal = row[isig].strip() if isig is not None and isig < len(row) else ""
-        pads.append({"name": name, "signal": signal, "x": x, "y": y})
+        netclass = row[inet].strip() if inet is not None and inet < len(row) else ""
+        pads.append({"name": name, "signal": signal, "x": x, "y": y,
+                     "netclass": netclass or UNCLASSIFIED})
     return pads
 
 
@@ -87,7 +97,7 @@ def group_by_edge(pads, cx, cy): # classifies each pad into top, bottom, left, o
     return edges
 
 
-def pava_min_pitch(targets, pitch):
+def smooth_die_pad_spacing(targets, pitch): # spaces landing pads evenly along the edge of the die, while keeping them as close as possible to their original positions
     n = len(targets)
     if n == 0:
         return []
@@ -105,7 +115,7 @@ def pava_min_pitch(targets, pitch):
     return [z[i] + i * pitch for i in range(n)]
 
 
-def required_scale(edges):
+def required_scale(edges): 
     s = 1.0 + 2.0 * LAND_KEEPOUT_GAP / min(KEEP_OUT_WIDTH, KEEP_OUT_HEIGHT)
     for edge, pads in edges.items():
         if not pads:
@@ -125,10 +135,10 @@ def place_probes(edges, cx, cy, scale):
             continue
         if edge in ("T", "B"):
             pads = sorted(pads, key=lambda p: p["x"])
-            us = pava_min_pitch([p["x"] for p in pads], STAGGER_STEP)
+            us = smooth_die_pad_spacing([p["x"] for p in pads], STAGGER_STEP)
         else:
             pads = sorted(pads, key=lambda p: p["y"])
-            us = pava_min_pitch([p["y"] for p in pads], STAGGER_STEP)
+            us = smooth_die_pad_spacing([p["y"] for p in pads], STAGGER_STEP)
         for i, (p, u) in enumerate(zip(pads, us)):
             row = i % LAND_ROWS
             if edge == "T":
@@ -427,6 +437,260 @@ def write_wiring_map(path, L):
                         f"{d['x']:.3f}", f"{d['y']:.3f}"])
 
 
+def _edge_order(pr):
+    return ("TBLR".index(pr["edge"]), int(pr["id"][1:]))
+
+
+def group_by_netclass(probes):
+    classes = {}
+    for pr in probes:
+        classes.setdefault(pr["die"]["netclass"], []).append(pr)
+    # within a block, keep shared nets contiguous, then order by land id
+    for members in classes.values():
+        members.sort(key=lambda pr: (pr["die"]["signal"], _edge_order(pr)))
+    classes = merge_diff_pairs(classes)
+    # emit the blocks in descending size so the widest sheet reads left-heavy
+    return dict(sorted(classes.items(), key=lambda kv: (-len(kv[1]), kv[0])))
+
+
+def _interleave_pairs(p_members, n_members):
+    # place each P land next to its N partner (the signal differing in exactly
+    # one position -- the polarity letter, e.g. CLKEXTP<0> / CLKEXTM<0>), so the
+    # merged column reads P, N, P, N... Unmatched lands trail at the end.
+    pool = list(n_members)
+    ordered = []
+    for p in p_members:
+        sig = p["die"]["signal"]
+        best_i, best_d = None, None
+        for i, q in enumerate(pool):
+            s = q["die"]["signal"]
+            if len(s) != len(sig):
+                continue
+            d = sum(a != b for a, b in zip(sig, s))
+            if best_d is None or d < best_d:
+                best_i, best_d = i, d
+        ordered.append(p)
+        if best_i is not None and best_d == 1:
+            ordered.append(pool.pop(best_i))
+    ordered.extend(pool)
+    return ordered
+
+
+def merge_diff_pairs(classes):
+    # merge net-class pairs that differ only by a trailing " P"/" N" (a
+    # differential pair split across two classes) into one block named by the
+    # shared prefix, with each P land interleaved next to its N partner.
+    out = {}
+    used = set()
+    for name in classes:
+        if name in used:
+            continue
+        base = None
+        if name.endswith(" P") and (name[:-2] + " N") in classes:
+            base, p_name, n_name = name[:-2], name, name[:-2] + " N"
+        elif name.endswith(" N") and (name[:-2] + " P") in classes:
+            base, p_name, n_name = name[:-2], name[:-2] + " P", name
+        if base is not None:
+            out[base.strip()] = _interleave_pairs(classes[p_name], classes[n_name])
+            used.add(p_name)
+            used.add(n_name)
+        else:
+            out[name] = classes[name]
+    return out
+
+
+def write_pcb_library_script(path, L):
+    # Emit a PcbLib footprint 'ProbeCard': the probe-card lands as pads, at
+    # their real positions (centred on the die centre), pad designators = land
+    # ids. This is the footprint half of the reusable probe-card component; the
+    # schematic symbol links to it by name. UNVERIFIED against a live Altium.
+    cx, cy = L["cx"], L["cy"]
+    PAD = PROBE_PAD_SIDE / 1000.0
+    HOLE = VIA_DRILL / 1000.0
+
+    def mm(v):
+        return f"{v:.4f}"
+
+    o = []
+    w = o.append
+    w(f"""// Auto-generated by auto_probe_pcb.py -- Altium PCB-library DelphiScript.
+// Open a PCB library FIRST: File > New > Library > PCB Library, make that
+// .PcbLib the ACTIVE document, then File > Run Script... and run
+// GenerateFootprint. Builds one footprint 'ProbeCard' whose pads are the
+// probe-card lands (pad designators = land ids), centred on the die centre.
+
+Var
+    Lib : IPCB_Library;
+    FP  : IPCB_LibComponent;
+
+Procedure AddFPPad(XMM, YMM : Double; Desig : String);
+Var Pad;
+Begin
+    Pad := PCBServer.PCBObjectFactory(ePadObject, eNoDimension, eCreate_Default);
+    Pad.X := MMsToCoord(XMM);
+    Pad.Y := MMsToCoord(YMM);
+    Pad.Layer := eMultiLayer;
+    Pad.TopShape := eRounded;
+    Pad.MidShape := eRounded;
+    Pad.BotShape := eRounded;
+    Pad.TopXSize := MMsToCoord({mm(PAD)}); Pad.TopYSize := MMsToCoord({mm(PAD)});
+    Pad.MidXSize := MMsToCoord({mm(PAD)}); Pad.MidYSize := MMsToCoord({mm(PAD)});
+    Pad.BotXSize := MMsToCoord({mm(PAD)}); Pad.BotYSize := MMsToCoord({mm(PAD)});
+    Pad.HoleSize := MMsToCoord({mm(HOLE)});
+    Pad.Plated := True;
+    Pad.Name := Desig;
+    FP.AddPCBObject(Pad);
+End;
+
+Procedure BuildPads;
+Begin""")
+    for pr in L["probes"]:
+        w(f"    AddFPPad({mm((pr['x']-cx)/1000)}, {mm((pr['y']-cy)/1000)}, "
+          f"{_pas_str(pr['id'])});")
+    w("""End;
+
+Procedure GenerateFootprint;
+Begin
+    If PCBServer = Nil Then
+    Begin
+        ShowMessage('PCBServer is nil -- the PCB editor is not loaded.');
+        Exit;
+    End;
+    Lib := PCBServer.GetCurrentPCBLibrary;
+    If Lib = Nil Then
+    Begin
+        ShowMessage('No PCB library open. Create one first: ' +
+            'File > New > Library > PCB Library, make it active, then run again.');
+        Exit;
+    End;
+    FP := PCBServer.CreatePCBLibComp;
+    FP.Name := 'ProbeCard';
+    BuildPads;
+    Lib.RegisterComponent(FP);
+    Lib.CurrentComponent := FP;
+    Lib.Board.ViewManager_FullUpdate;
+    ShowMessage('Footprint ProbeCard built in the library. Save the .PcbLib.');
+End;""")
+
+    with open(path, "w", newline="\n") as f:
+        f.write("\n".join(o))
+
+
+def write_sch_library_script(path, L):
+    # Emit a SchLib multi-part component 'ProbeCard': one part per net-class
+    # block (rectangle + one pin per land), pins designated by land id and
+    # named by signal, plus a footprint-model reference to the 'ProbeCard'
+    # footprint. Pins map to pads by matching name, so no explicit pin map is
+    # needed. In a SchLib every part shares the same coordinate space (you
+    # switch parts in the editor), so all parts are drawn at the origin.
+    # UNVERIFIED against a live Altium -- multi-part components and footprint
+    # models are the most version-sensitive part of the Sch API.
+    classes = group_by_netclass(L["probes"])
+    n_parts = len(classes)
+
+    o = []
+    w = o.append
+    w("""// Auto-generated by auto_probe_pcb.py -- Altium Sch-library DelphiScript.
+// Open a schematic library FIRST: File > New > Library > Schematic Library,
+// make that .SchLib the ACTIVE document, then File > Run Script... and run
+// GenerateSymbol. Builds one multi-part component 'ProbeCard' (one part per
+// net class) with a footprint-model reference to the 'ProbeCard' footprint.
+
+Var
+    Lib  : ISch_Lib;
+    Comp : ISch_Component;
+
+Procedure AddPartRect(PartId, Xmil, Ymil, Wmil, Hmil : Integer);
+Var R;
+Begin
+    R := SchServer.SchObjectFactory(eRectangle, eCreate_GlobalCopy);
+    R.OwnerPartId := PartId;
+    R.OwnerPartDisplayMode := 0;
+    R.Location := Point(MilsToCoord(Xmil), MilsToCoord(Ymil - Hmil));
+    R.Corner := Point(MilsToCoord(Xmil + Wmil), MilsToCoord(Ymil));
+    R.LineWidth := eSmall;
+    R.IsSolid := True;
+    R.AreaColor := $00E7FFFF;
+    R.Color := $00000080;
+    Comp.AddSchObject(R);
+End;
+
+Procedure AddPartPin(PartId, Xmil, Ymil : Integer; Desig, Nm : String);
+Var Pin;
+Begin
+    Pin := SchServer.SchObjectFactory(ePin, eCreate_GlobalCopy);
+    Pin.OwnerPartId := PartId;
+    Pin.OwnerPartDisplayMode := 0;
+    Pin.Orientation := eRotate0;
+    Pin.Location := Point(MilsToCoord(Xmil - """ + str(SCH_PIN_LENGTH) + """), MilsToCoord(Ymil));
+    Pin.PinLength := MilsToCoord(""" + str(SCH_PIN_LENGTH) + """);
+    Pin.Designator := Desig;
+    Pin.Name := Nm;
+    Pin.ShowName := True;
+    Pin.ShowDesignator := True;
+    Pin.Electrical := eElectricPassive;
+    Comp.AddSchObject(Pin);
+End;
+""")
+
+    build_calls = []
+    for ci, (netclass, members) in enumerate(classes.items(), start=1):
+        n = len(members)
+        height = (n + 1) * SCH_PIN_PITCH
+        proc = f"BuildPart{ci}"
+        build_calls.append(proc)
+        w(f"\nProcedure {proc};\nBegin")
+        w(f"    AddPartRect({ci}, 0, 0, {SCH_BLOCK_WIDTH}, {height});")
+        for k, pr in enumerate(members):
+            py = -(k + 1) * SCH_PIN_PITCH
+            sig = pr["die"]["signal"] or pr["id"]
+            w(f"    AddPartPin({ci}, 0, {py}, {_pas_str(pr['id'])}, {_pas_str(sig)});")
+        w("End;")
+
+    # PartCount: some Altium versions want (parts + 1); if a part comes out
+    # blank or missing, flip this to n_parts + 1.
+    # NOTE: re-running adds another ProbeCard; delete the existing one in the
+    # SCH Library panel before re-running so copies don't stack.
+    w(f"""
+Procedure GenerateSymbol;
+Var Impl;
+Begin
+    If SchServer = Nil Then
+    Begin
+        ShowMessage('SchServer is nil -- the schematic editor is not loaded.');
+        Exit;
+    End;
+    Lib := SchServer.GetCurrentSchDocument;
+    If Lib = Nil Then
+    Begin
+        ShowMessage('No schematic library open. Create one first: ' +
+            'File > New > Library > Schematic Library, make it active, then run again.');
+        Exit;
+    End;
+    Comp := SchServer.SchObjectFactory(eSchComponent, eCreate_GlobalCopy);
+    Comp.LibReference := 'ProbeCard';
+    Comp.ComponentDescription := 'Probe card -- one part per net class';
+    Comp.Designator.Text := 'PC?';
+    Comp.PartCount := {n_parts};
+    Comp.DisplayMode := 0;""")
+    for proc in build_calls:
+        w(f"    {proc};")
+    w("""    Impl := Comp.AddSchImplementation;
+    Impl.ModelName := 'ProbeCard';
+    Impl.ModelType := 'PCBLIB';
+    Impl.IsCurrent := True;
+    Lib.AddSchComponent(Comp);
+    Lib.CurrentSchComponent := Comp;
+    Comp.GraphicallyInvalidate;
+    ShowMessage('Multi-part component ProbeCard built in the library. ' +
+        'Save the .SchLib.');
+End;""")
+
+    with open(path, "w", newline="\n") as f:
+        f.write("\n".join(o))
+    return classes
+
+
 def find_input_csv():
     csvs = sorted(INPUT_DIR.glob("*.csv"))
     if not csvs:
@@ -466,6 +730,16 @@ def main():
     pas_path = OUTPUT_DIR / f"{csv_path.stem}_probe_card.pas"
     write_altium_script(pas_path, L)
     print(f"Wrote Altium script:{pas_path}")
+
+    fp_path = OUTPUT_DIR / f"{csv_path.stem}_probecard_footprint.pas"
+    write_pcb_library_script(fp_path, L)
+    print(f"Wrote PCB-lib footprint: {fp_path}")
+
+    sym_path = OUTPUT_DIR / f"{csv_path.stem}_probecard_symbol.pas"
+    classes = write_sch_library_script(sym_path, L)
+    print(f"Wrote Sch-lib symbol:    {sym_path}")
+    cc = {k: len(v) for k, v in classes.items()}
+    print(f"Net-class parts ({len(cc)}): {cc}")
 
     print(f"{len(pads)} die pads / {len(L['probes'])} probe lands "
           f"({VIA_DRILL} um dia drill, {PROBE_PAD_SIDE} um land).")

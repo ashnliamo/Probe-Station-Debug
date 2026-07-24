@@ -83,14 +83,25 @@ COL_PAD, COL_SIGNAL, COL_X, COL_Y = ("pad", "signal", "x (um)", "y (um)")
 COL_IO = "i/o"     # grouping column: INPUTn / OUTPUTn, blank = unused
 _IO_RE = re.compile(r"(INPUT|OUTPUT)\s*(\d+)$")
 GLOBAL_OUT = "*"   # a bare 'OUTPUT' pad: common to every group, on every chip
+SPLIT_OUT = "+"    # an 'OUTPUTSPLIT' pad: on every chip, halved across the two layers
+SINGLE = "S"       # INPUTSINGLE / OUTPUTSINGLE: one shorted continuity coupon, own layer
 
 
 def classify_io(io_cell):
     """'INPUT3' -> ('input', 3); 'OUTPUT7' -> ('output', 7); a bare 'OUTPUT' ->
-    ('output', GLOBAL_OUT) -- a common output wired to every group; else ('', None)."""
+    ('output', GLOBAL_OUT) -- a common output wired to every group; 'OUTPUTSPLIT' ->
+    ('output', SPLIT_OUT) -- on every chip, halved across the two layers;
+    'INPUTSINGLE'/'OUTPUTSINGLE' -> (role, SINGLE) -- one shorted continuity coupon on
+    its own layer; else ('', None)."""
     s = io_cell.strip().upper()
     if s == "OUTPUT":
         return ("output", GLOBAL_OUT)
+    if s == "OUTPUTSPLIT":
+        return ("output", SPLIT_OUT)
+    if s == "INPUTSINGLE":
+        return ("input", SINGLE)
+    if s == "OUTPUTSINGLE":
+        return ("output", SINGLE)
     m = _IO_RE.match(s)
     if not m:
         return ("", None)
@@ -98,11 +109,36 @@ def classify_io(io_cell):
 
 
 # ----------------------------------------------------------------------
-# CSV parsing
+# CSV / XLSX parsing
 # ----------------------------------------------------------------------
+def load_rows(path):
+    """Read the pinout as a list of string-cell rows, from .csv or .xlsx/.xlsm.
+    For a workbook, use the first sheet whose cells hold the X/Y header row
+    (so a cover/notes sheet is skipped); every cell is stringified, None -> ''."""
+    path = pathlib.Path(path)
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        try:
+            import openpyxl                              # optional; only for .xlsx
+        except ImportError:
+            raise SystemExit(f"Reading {path.name} needs openpyxl: pip install openpyxl "
+                             f"(or export the sheet to .csv).")
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        best = None
+        for ws in wb.worksheets:
+            rows = [["" if c is None else str(c) for c in r]
+                    for r in ws.iter_rows(values_only=True)]
+            if best is None:
+                best = rows                              # fall back to the first sheet
+            if any(COL_X in [c.strip().lower() for c in row]
+                   and COL_Y in [c.strip().lower() for c in row] for row in rows):
+                return rows
+        return best or []
+    with open(path, newline="") as f:
+        return list(csv.reader(f))
+
+
 def read_pads(csv_path):
-    with open(csv_path, newline="") as f:
-        rows = list(csv.reader(f))
+    rows = load_rows(csv_path)
     header_idx = None
     for i, row in enumerate(rows):
         cells = [c.strip().lower() for c in row]
@@ -149,19 +185,22 @@ def place_pads(pads, raw_bounds, margins):
 
 def assign_groups(inputs, outputs):
     """Group pads by IO number. A group needs inputs and at least one output -- its own
-    OUTPUTn or a bare 'OUTPUT' pad, which is common to every group (so it appears on
-    every chip). Returns [{"num", "inputs", "outputs"}] sorted by number."""
+    OUTPUTn, a bare 'OUTPUT' (common to every group), or an 'OUTPUTSPLIT' pad (added
+    to every chip's layers at build time). Returns [{"num", "inputs", "outputs"}]
+    sorted by number. OUTPUTSPLIT pads are NOT attached here -- build_chip halves them
+    across each chip's two layers."""
     common = [p for p in outputs if p["group"] == GLOBAL_OUT]
+    has_split = any(p["group"] == SPLIT_OUT for p in outputs)
     in_by, out_by = {}, {}
     for p in inputs:
         in_by.setdefault(p["group"], []).append(p)
     for p in outputs:
-        if p["group"] != GLOBAL_OUT:
+        if p["group"] not in (GLOBAL_OUT, SPLIT_OUT):
             out_by.setdefault(p["group"], []).append(p)
     groups = []
     for n in sorted(in_by):
         outs = out_by.get(n, []) + common          # own outputs first, then the common
-        if outs:
+        if outs or has_split:                      # split pads guarantee output access
             groups.append({"num": n, "inputs": in_by[n], "outputs": outs})
     return groups
 
@@ -228,8 +267,18 @@ def input_target_len(k):
 
 
 def ordered_inputs(group):
-    """Group inputs ranked by distance to the first output (rank k -> target R)."""
-    ref = group["outputs"][0]
+    """Group inputs ranked by distance to the first output (rank k -> target R). A
+    group whose only outputs are OUTPUTSPLIT pads has no dedicated output here, so it
+    ranks by the input centroid instead -- a stable reference that does not depend on
+    which split pads a chip happens to get, keeping ranks identical across the sizing
+    and drawing passes."""
+    outs = group["outputs"]
+    if outs:
+        ref = outs[0]
+    else:
+        n = len(group["inputs"])
+        ref = {"x": sum(p["x"] for p in group["inputs"]) / n,
+               "y": sum(p["y"] for p in group["inputs"]) / n}
     return sorted(group["inputs"], key=lambda p: dist(p, ref))
 
 
@@ -524,15 +573,31 @@ def central_plane(bounds):
             maxx - PLANE_RING_MARGIN, maxy - PLANE_RING_MARGIN)
 
 
-def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads):
+def _plane_label(cell, txt, plane, layer_idx):
+    """Centred coupon label on the plane; 2-layer chips stack their two labels."""
+    px0, py0, px1, py1 = plane
+    size = min(200.0, max(40.0, (px1 - px0) * 0.8 / (0.62 * len(txt)))) * 0.7
+    cx = (px0 + px1) / 2.0 - 0.62 * size * len(txt) / 2.0
+    cy = (py0 + py1) / 2.0 - size / 2.0 + (1 - 2 * layer_idx) * size * 1.6
+    cell.add(*gdstk.text(txt, size, (cx, cy), layer=LABEL_LAYER, datatype=LABEL_DT))
+
+
+def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs=(),
+               single=False):
     """One group on metal `layer_idx`: a central PLANE is the shared node; each INPUT
     grows a resistor comb outside the ring, folded to fill its own along-edge band,
     returning inward through a pad gap to the plane. Each OUTPUT joins the plane with
-    a pad-width finger. 2nd-layer groups get a via at each pad. Returns
+    a pad-width finger. `extra_outputs` are this layer's OUTPUTSPLIT taps -- drawn as
+    extra output fingers but kept OUT of input ranking (which uses the group's own
+    outputs, or its input centroid), so ranks match the sizing pass. `single` draws a
+    continuity coupon instead: no combs -- every INPUTSINGLE and OUTPUTSINGLE pad is
+    shorted straight to the plane, so each independent input is a per-pin continuity
+    check against the shared return. 2nd-layer groups get a via at each pad. Returns
     (wiring_polys, csv_rows)."""
     L = metal_layer(layer_idx)
     needs_via = layer_idx > 0
     hp = PAD_SIZE / 2.0
+    all_outs = list(group["outputs"]) + list(extra_outputs)
     polys = []
 
     def add(obj):
@@ -548,15 +613,37 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads):
     plane = (px0, py0, px1, py1)
     edge_coords = near_edge_coords(all_pads, bounds)
 
+    def finger(o):                                   # pad-width tab joining o to plane
+        e = edge_of(o, bounds)
+        cx, cy = o["x"], o["y"]
+        if e in ("bottom", "top"):
+            fx0, fx1 = cx - hp, cx + hp
+            add(rect(fx0, cy, fx1, py0 + FINGER_OVERLAP, L) if e == "bottom"
+                else rect(fx0, py1 - FINGER_OVERLAP, fx1, cy, L))
+        else:
+            fy0, fy1 = cy - hp, cy + hp
+            add(rect(cx, fy0, px0 + FINGER_OVERLAP, fy1, L) if e == "left"
+                else rect(px1 - FINGER_OVERLAP, fy0, cx, fy1, L))
+        if needs_via:
+            via_at((cx, cy))
+
+    if single:                                       # continuity coupon: short all pads
+        # Returns are OUTPUTSINGLE pads plus any OUTPUTSPLIT half on this layer.
+        if ADD_LABELS:
+            ins = ", ".join(p["name"] for p in group["inputs"])
+            rets = ", ".join(p["name"] for p in all_outs)
+            _plane_label(cell, f"Single inputs: {ins}; Return: {rets}", plane, layer_idx)
+        for o in group["inputs"] + all_outs:
+            finger(o)
+        rows = [[chip_idx, layer_idx + 1, inp["name"], inp["signal"],
+                 ";".join(o["name"] for o in all_outs), "0.00", "0",
+                 "continuity"] for inp in group["inputs"]]
+        return polys, rows
+
     if ADD_LABELS:                                   # name the coupon on the plane
         ins = ", ".join(p["name"] for p in ordered_inputs(group))
-        outs = ", ".join(p["name"] for p in group["outputs"])
-        txt = f"Inputs: {ins}, Outputs: {outs}"
-        size = min(200.0, max(40.0, (px1 - px0) * 0.8 / (0.62 * len(txt)))) * 0.7
-        cx = (px0 + px1) / 2.0 - 0.62 * size * len(txt) / 2.0      # centre horizontally
-        cy = (py0 + py1) / 2.0 - size / 2.0 + (1 - 2 * layer_idx) * size * 1.6
-        cell.add(*gdstk.text(txt, size, (cx, cy),                 # 2-layer chips stack
-                             layer=LABEL_LAYER, datatype=LABEL_DT))
+        outs = ", ".join(p["name"] for p in all_outs)
+        _plane_label(cell, f"Inputs: {ins}, Outputs: {outs}", plane, layer_idx)
 
     # One disjoint along-edge band per input (width ~ trace length); solved below.
     band_of, gaps_of = {}, {}
@@ -578,26 +665,11 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads):
             via_at((inp["x"], inp["y"]))
         r_vals.append(r)
         rows.append([chip_idx, layer_idx + 1, inp["name"],
-                     inp["signal"], ";".join(o["name"] for o in group["outputs"]),
+                     inp["signal"], ";".join(o["name"] for o in all_outs),
                      f"{r:.2f}", f"{clen:.0f}"])
 
-    for o in group["outputs"]:
-        e = edge_of(o, bounds)
-        cx, cy = o["x"], o["y"]
-        if e in ("bottom", "top"):
-            fx0, fx1 = cx - hp, cx + hp
-            if e == "bottom":
-                add(rect(fx0, cy, fx1, py0 + FINGER_OVERLAP, L))
-            else:
-                add(rect(fx0, py1 - FINGER_OVERLAP, fx1, cy, L))
-        else:
-            fy0, fy1 = cy - hp, cy + hp
-            if e == "left":
-                add(rect(cx, fy0, px0 + FINGER_OVERLAP, fy1, L))
-            else:
-                add(rect(px1 - FINGER_OVERLAP, fy0, cx, fy1, L))
-        if needs_via:
-            via_at((cx, cy))
+    for o in all_outs:
+        finger(o)
 
     # Group's all-contacting parallel resistance (every probe landed), on each row.
     gpar = 1.0 / sum(1.0 / r for r in r_vals) if r_vals else float("inf")
@@ -876,10 +948,11 @@ def build_schematic_svg(chip_idx, rows):
         rs = by_layer[layer]
         outs = rs[0][4]
         gpar = rs[0][7]
+        is_single = gpar == "continuity"             # SINGLE coupon: shorts, no ladder
+        subtitle = "continuity" if is_single else f"all-parallel {gpar} Ω"
         top = y
         body.append(f'<text x="{x_name}" y="{top:.0f}" class="ttl">'
-                    f'Chip {chip_idx} — Layer {layer}  '
-                    f'(all-parallel {gpar} Ω)</text>')
+                    f'Chip {chip_idx} — Layer {layer}  ({subtitle})</text>')
         row_y = top + head_h
         ys = [row_y + i * row_h for i in range(len(rs))]
         for (row, ry) in zip(rs, ys):
@@ -892,13 +965,17 @@ def build_schematic_svg(chip_idx, rows):
                             f'class="sig">{_esc(sig)}</text>')
             body.append(f'<line x1="{x_term+9:.0f}" y1="{ry:.0f}" x2="{x_r0:.0f}" '
                         f'y2="{ry:.0f}" class="wire"/>')
-            body.append(f'<polyline points="{_resistor_zig(x_r0, x_r1, ry)}" '
-                        f'class="wire"/>')
-            body.append(f'<text x="{(x_r0+x_r1)/2:.0f}" y="{ry-12:.0f}" '
-                        f'class="val" text-anchor="middle">{r_ohm} Ω</text>')
-            body.append(f'<line x1="{x_r1:.0f}" y1="{ry:.0f}" x2="{x_bus:.0f}" '
-                        f'y2="{ry:.0f}" class="wire"/>')
-        # shared output node: vertical bus tying every resistor, then out to the pad
+            if is_single:                            # direct short to the return node
+                body.append(f'<line x1="{x_r0:.0f}" y1="{ry:.0f}" x2="{x_bus:.0f}" '
+                            f'y2="{ry:.0f}" class="wire"/>')
+            else:
+                body.append(f'<polyline points="{_resistor_zig(x_r0, x_r1, ry)}" '
+                            f'class="wire"/>')
+                body.append(f'<text x="{(x_r0+x_r1)/2:.0f}" y="{ry-12:.0f}" '
+                            f'class="val" text-anchor="middle">{r_ohm} Ω</text>')
+                body.append(f'<line x1="{x_r1:.0f}" y1="{ry:.0f}" x2="{x_bus:.0f}" '
+                            f'y2="{ry:.0f}" class="wire"/>')
+        # shared node: vertical bus tying every input, then out to the return/output pad
         oy = ys[-1] + foot_h - 24
         body.append(f'<line x1="{x_bus:.0f}" y1="{ys[0]:.0f}" x2="{x_bus:.0f}" '
                     f'y2="{oy:.0f}" class="bus"/>')
@@ -906,7 +983,7 @@ def build_schematic_svg(chip_idx, rows):
                     f'y2="{oy:.0f}" class="wire"/>')
         body.append(f'<circle cx="{x_out:.0f}" cy="{oy:.0f}" r="4" class="node"/>')
         body.append(f'<text x="{x_out+10:.0f}" y="{oy+4:.0f}" class="lbl">'
-                    f'OUTPUT: {_esc(outs)}</text>')
+                    f'{"RETURN" if is_single else "OUTPUT"}: {_esc(outs)}</text>')
         y = ys[-1] + foot_h + gap
     height = y
     style = ("<style>.wire{stroke:#222;stroke-width:1.6;fill:none}"
@@ -928,16 +1005,21 @@ def _esc(s):
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
+INPUT_EXTS = (".csv", ".xlsx", ".xlsm")
+
+
 def find_input_csv():
-    """The single spreadsheet in inputs/ (any .csv name). Errors if none or several."""
-    csvs = sorted(INPUT_DIR.glob("*.csv"))
-    if not csvs:
-        raise SystemExit(f"No .csv found in {INPUT_DIR} -- put your pinout there.")
-    if len(csvs) > 1:
-        names = ", ".join(p.name for p in csvs)
-        raise SystemExit(f"Multiple .csv files in {INPUT_DIR} ({names}); keep just one, "
-                         f"or pass the path: py io_pair_wiring_parallel.py <file.csv>")
-    return csvs[0]
+    """The single pinout in inputs/ (any .csv or .xlsx name; Excel lock files
+    beginning '~$' are ignored). Errors if none or several."""
+    files = sorted(p for p in INPUT_DIR.glob("*")
+                   if p.suffix.lower() in INPUT_EXTS and not p.name.startswith("~$"))
+    if not files:
+        raise SystemExit(f"No .csv or .xlsx found in {INPUT_DIR} -- put your pinout there.")
+    if len(files) > 1:
+        names = ", ".join(p.name for p in files)
+        raise SystemExit(f"Multiple input files in {INPUT_DIR} ({names}); keep just one, "
+                         f"or pass the path: py io_pair_wiring_parallel.py <file>")
+    return files[0]
 
 
 def parse_args(argv):
@@ -989,6 +1071,8 @@ def size_and_place(pads, groups):
     ring_w, ring_h = max(rxs) - min(rxs), max(rys) - min(rys)
     edge_depth = {"left": 0.0, "right": 0.0, "top": 0.0, "bottom": 0.0}
     for g in groups:
+        if g.get("single"):                 # continuity coupon has fingers, no combs
+            continue
         for e, items in edge_inputs(g, raw_bounds).items():
             gaps = edge_gaps(e, raw_edges)
             elo, ehi = edge_along_range(e, raw_bounds)
@@ -1017,18 +1101,39 @@ def size_and_place(pads, groups):
     return edge_depth, ring_w, ring_h, scale
 
 
-def build_chip(ci, chip_groups, pads, bounds):
+def split_for_chip(split_outs, n_layers):
+    """Halve the OUTPUTSPLIT pads across the chip's layers, alternating so each half
+    is spread out (list them in perimeter order to spread by position). A half serves
+    as extra output taps for a parallel layer, or as the shorted return for a single
+    continuity layer. A one-layer chip takes them all. Returns {layer_idx: [pads]}."""
+    split_outs = list(split_outs)
+    if not split_outs:
+        return {}
+    if n_layers <= 1:
+        return {0: split_outs}
+    return {0: split_outs[0::2], 1: split_outs[1::2]}
+
+
+def build_chip(ci, chip_groups, pads, bounds, split_outs=()):
     """One chip's GDS: every pad on the top layer (wired ones tagged to their group),
-    each group's combs on its own metal layer, then the die outline LAST. Returns
-    (library, geo, csv_rows); geo maps net-id -> polygons."""
+    each group's combs on its own metal layer, then the die outline LAST. OUTPUTSPLIT
+    pads are halved across the parallel layers -- each half wired to that layer's plane
+    as extra output taps. A single/continuity coupon shorts its INPUTSINGLE and
+    OUTPUTSINGLE pads to its plane. Returns (library, geo, csv_rows); geo maps
+    net-id -> polygons."""
     top = metal_layer(0)
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
     cell = lib.new_cell(f"CHIP{ci}")
     geo = {}
+    split_by_layer = split_for_chip(split_outs, len(chip_groups))
     pad_net = {}
     for group in chip_groups:
         for p in group["inputs"] + group["outputs"]:
             pad_net[id(p)] = ("group", group["num"])
+    for li, extra in split_by_layer.items():       # split pads join their layer's net
+        if li < len(chip_groups):
+            for p in extra:
+                pad_net[id(p)] = ("group", chip_groups[li]["num"])
     for p in pads:
         key = pad_net.get(id(p), ("pads",))
         poly = pad_poly(p, top)
@@ -1048,7 +1153,9 @@ def build_chip(ci, chip_groups, pads, bounds):
                                      layer=LABEL_LAYER, datatype=LABEL_DT))
     rows = []
     for li, group in enumerate(chip_groups):
-        wpolys, grows = draw_group(group, li, bounds, cell, ci, pads)
+        wpolys, grows = draw_group(group, li, bounds, cell, ci, pads,
+                                   split_by_layer.get(li, []),
+                                   single=group.get("single", False))
         geo.setdefault(("group", group["num"]), []).extend(wpolys)
         rows.extend(grows)
     if ADD_DIE_OUTLINE:                          # bottom layer, built LAST
@@ -1063,16 +1170,32 @@ def main():
         layers = ask_layers()
     groups_per_chip = layers
     pads = read_pads(csv_path)
-    inputs = [p for p in pads if p["io"] == "input"]
-    outputs = [p for p in pads if p["io"] == "output"]
-    if not inputs or not outputs:
+    single_in = [p for p in pads if p["io"] == "input" and p["group"] == SINGLE]
+    single_out = [p for p in pads if p["io"] == "output" and p["group"] == SINGLE]
+    has_split = any(p["group"] == SPLIT_OUT for p in pads)
+    if single_out and not single_in:                 # OUTPUTSINGLE only pairs with INPUTSINGLE
+        raise SystemExit("OUTPUTSINGLE pads only pair with INPUTSINGLE: add INPUTSINGLE "
+                         "pads, or remove the OUTPUTSINGLE ones.")
+    if single_in and not (single_out or has_split):  # INPUTSINGLE needs a shared return
+        raise SystemExit("INPUTSINGLE pads need a shared return: add OUTPUTSINGLE or "
+                         "OUTPUTSPLIT pads for the continuity coupon.")
+    inputs = [p for p in pads if p["io"] == "input" and p["group"] != SINGLE]
+    outputs = [p for p in pads if p["io"] == "output" and p["group"] != SINGLE]
+    if not (inputs or single_in) or not (outputs or single_out):
         raise SystemExit("Need at least one input and one output.")
     groups = assign_groups(inputs, outputs)
+    split_outs = [p for p in outputs if p["group"] == SPLIT_OUT]
     if any(p["group"] == GLOBAL_OUT for p in outputs) and groups_per_chip > 1:
         print("  ! A common OUTPUT pad is shared by every group; using 1 group per "
               "chip so two groups can't tie their shared output together.")
         groups_per_chip = 1
+    if split_outs and groups_per_chip < 2:
+        print("  ! OUTPUTSPLIT needs 2 layers to halve across; with 1 layer per chip "
+              "all OUTPUTSPLIT pads go on the single layer.")
     coupons = split_coupons(groups, MAX_BINARY_INPUTS)   # big groups -> sub-coupons
+    if single_in:                                    # one shorted continuity coupon
+        coupons.append({"num": SINGLE, "sub": 0, "single": True,
+                        "inputs": single_in, "outputs": single_out})
 
     edge_depth, ring_w, ring_h, scale = size_and_place(pads, coupons)
 
@@ -1081,7 +1204,7 @@ def main():
           ", ".join(f"{e} {edge_depth[e]:.0f}" for e in ("left", "right", "top", "bottom")))
     print(f"Aluminium {METAL_THICKNESS_UM} um thick, W={WIRE_WIDTH} um -> "
           f"sheet res {SHEET_RES:.3f} ohm/sq; {WIRE_WIDTH/SHEET_RES:.1f} um per ohm.")
-    big = max((len(c["inputs"]) for c in coupons), default=0)
+    big = max((len(c["inputs"]) for c in coupons if not c.get("single")), default=0)
     if input_target_r(big) > 1e6 or max(DIE_W, DIE_H) > 5e4:
         print(f"  ! BINARY ladder still needs a {input_target_r(big):,.0f} ohm "
               f"resistor (a {big}-input coupon) and a {DIE_W/1000:.0f} x "
@@ -1090,14 +1213,22 @@ def main():
     wired_in = sum(len(g["inputs"]) for g in groups)
     print(f"Matched group numbers {matched}: {len(groups)} groups, "
           f"{wired_in} inputs wired (unmatched numbers dropped).")
-    if len(coupons) > len(groups):
-        print(f"  Split into {len(coupons)} layers "
-              f"(<= {MAX_BINARY_INPUTS} inputs per layer).")
+    n_par = sum(1 for c in coupons if not c.get("single"))
+    if n_par > len(groups):
+        print(f"  Split into {n_par} layers (<= {MAX_BINARY_INPUTS} inputs per layer).")
     for g in groups:
         nsub = sum(1 for c in coupons if c["num"] == g["num"])
         extra = f" -> {nsub} layers total" if nsub > 1 else ""
         print(f"  group {g['num']}: {len(g['inputs'])} inputs, "
               f"{len(g['outputs'])} outputs{extra}")
+    if single_in:
+        ret = f"{len(single_out)} OUTPUTSINGLE" + (" + OUTPUTSPLIT half" if split_outs else "")
+        print(f"  SINGLE continuity coupon: {len(single_in)} INPUTSINGLE shorted to its "
+              f"return [{ret}] on one layer, per-pin continuity.")
+    if split_outs:
+        top_n = len(split_outs[0::2])
+        print(f"  {len(split_outs)} OUTPUTSPLIT pads on every chip, halved per chip: "
+              f"{top_n} on the top layer, {len(split_outs) - top_n} on the bottom.")
 
     xs = [p["x"] for p in pads]
     ys = [p["y"] for p in pads]
@@ -1116,7 +1247,7 @@ def main():
     all_rows = []
     mosaic_entries = []
     for ci, chip_coupons in enumerate(chips, 1):
-        lib, geo, rows = build_chip(ci, chip_coupons, pads, bounds)
+        lib, geo, rows = build_chip(ci, chip_coupons, pads, bounds, split_outs)
         all_rows.extend(rows)
         tags = [tag(c) for c in chip_coupons]
         gds_out = safe_path(GDS_DIR / f"groups_{'_'.join(tags)}.gds")

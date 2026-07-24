@@ -34,20 +34,65 @@ tests/          self-checks, optional
 SCRIPT 1 -- GENERATE THE MASKS   io_pair_wiring_parallel.py
 ============================================================================
 
-STEP 1A:  Prepare the pinout CSV
+STEP 1A:  Prepare the pinout
 
-Put your probe-card pinout in the inputs folder. Any single .csv name works.
+Put your probe-card pinout in the inputs folder. Any single .csv or .xlsx file
+works -- for a workbook the first sheet holding the X and Y header is used, and an
+open-in-Excel lock file starting with ~$ is ignored.
 
 Append a column named "I/O" after the Net Class column. Column names are
 case-insensitive and extra columns are ignored. Tag each pad:
 
-INPUTn     this pad is an input  in group n
-OUTPUTn    this pad is an output in group n
-OUTPUT     a common output, shared by every group and present on every chip
+INPUTn      this pad is an input  in group n
+OUTPUTn     this pad is an output in group n
+OUTPUT      a common output, shared by every group and present on every chip
+OUTPUTSPLIT an output on every chip, halved across the chip's two layers
+INPUTSINGLE an input on the shorted continuity coupon
+OUTPUTSINGLE the return on the shorted continuity coupon
 
 A bare OUTPUT tag, with no number, marks a common output. It is added to every
 group, so it appears on every chip. When a common OUTPUT is present the generator
 puts one group per chip, so two groups can never tie their shared output together.
+
+An OUTPUTSPLIT tag also puts the pad on every chip, but instead of joining every
+group it is halved across the chip's two layers -- half of the OUTPUTSPLIT pads
+wire to the top-layer group, the other half to the bottom-layer group. No pad is
+shared between the two layers, so the two groups stay independent and you keep two
+layers per chip. This gives each layer extra, redundant output taps so a coupon is
+still readable if some output probes miss contact. Pads are alternated in list
+order -- 1st, 3rd, 5th to the top layer, 2nd, 4th, 6th to the bottom -- so listing
+them in position order spreads each layer's half across the die. This assumes the
+OUTPUTSPLIT pads are independently routed, NOT shorted together externally. Do not
+combine OUTPUTSPLIT with a bare OUTPUT, since the bare OUTPUT forces one layer per
+chip and there is then nothing to halve across.
+
+INPUTSINGLE and OUTPUTSINGLE build a separate continuity coupon on its own layer.
+Use this when your input signals are NOT shorted together externally, so a parallel
+resistance reading is impossible. On that layer every INPUTSINGLE pad and its return
+are shorted straight to one plane, with no resistors. You then test each INPUTSINGLE
+probe on its own, measuring continuity to the shared return: a landed probe reads a
+short, a missing probe reads open. Because the inputs are independent you measure one
+at a time, so each is resolved individually.
+
+The single coupon lives on one layer, kept apart from the parallel coupons, but it can
+share a chip with a parallel coupon on the other layer. Its return can be OUTPUTSINGLE
+pads, the OUTPUTSPLIT half that lands on the single layer, or both. So INPUTSINGLE must
+be paired with OUTPUTSINGLE or OUTPUTSPLIT, and if neither is present the tool stops
+with an error. OUTPUTSINGLE only pairs with INPUTSINGLE, and it too errors if there are
+no INPUTSINGLE pads. In the results CSV these rows show a resistance of 0 and are marked
+continuity to set them apart from the parallel-decode rows.
+
+INPUTSINGLE and OUTPUTSINGLE build a continuity coupon for input signals that are
+NOT shorted together externally, so a parallel resistance measurement is not
+possible. All INPUTSINGLE and OUTPUTSINGLE pads are shorted together on one layer,
+with no resistors. Because the signals are independent, you test each INPUTSINGLE
+one at a time -- measure continuity from that pin to any OUTPUTSINGLE return, with
+the other pins left floating. Landed reads near zero ohm, open reads infinite. The
+OUTPUTSINGLE pads are the shared return, so use two or more for redundancy in case
+a return probe misses. This coupon lives on its own layer but can share a chip with
+a normal parallel group, so a two-layer chip can carry one parallel group and the
+continuity coupon. You must supply at least one INPUTSINGLE and at least one
+OUTPUTSINGLE together, or the program stops with an error.
 
 STEP 1B:  Run the program
 

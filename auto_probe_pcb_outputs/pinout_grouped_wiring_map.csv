@@ -1,4 +1,4 @@
-land_id,side,row,signal,die_pad,land_x_mm,land_y_mm,die_x_um,die_y_um
+land_id,edge,row,signal,die_pad,land_x_mm,land_y_mm,die_x_um,die_y_um
 T1,T,0,VSS,T2,75.275,99.193,97850.169,78631.569
 T2,T,1,VDD08D,T3,75.977,100.393,97943.269,78631.569
 T3,T,0,VSS,T4,76.679,99.193,98057.071,78631.569
