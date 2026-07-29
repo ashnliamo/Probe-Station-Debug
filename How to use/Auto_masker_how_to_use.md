@@ -11,11 +11,24 @@ This project has two scripts that work as a pair:
 WHAT THE TEST CHIP DOES
 
 Each INPUT pad on the chip is wired through a resistor of a known, unique value
-to a shared central node, which is then wired to all the output pads. The
-resistor values are chosen as a binary ladder: 1x, 2x, 4x, 8x, and so on. When
+to a shared central node, which is then wired to all the output pads. When
 you land the whole probe card and measure the resistance from the inputs to the
 output, you are reading all the input resistors in parallel. The single parallel number tells you exactly which probes are
 touching and which are open.
+
+The resistor values are chosen as a binary ladder: 1x, 2x, 4x, 8x, and so on.
+COIL_BASE_R is the smallest resistor and each rung doubles from there. Probes add
+in CONDUCTANCE, and doubling makes every subset sum distinct, so each pattern of
+landed and open probes reads as its own number.
+
+Watch the die size as you raise MAX_BINARY_INPUTS. Doubling every rung means the
+biggest resistor is 2 to the power n-1 times the smallest, so an 8-input coupon
+needs a 128x resistor and a very long trace. The program warns when the ladder
+forces a large resistor or a large die.
+
+The program also prints the worst coupon's decode margin on every run and warns if
+it drops below 0.1 percent. That margin is the fraction of full scale your meter
+has to resolve to tell every pattern apart, so it is the number to watch.
 
 ONE-TIME SETUP
 

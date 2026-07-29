@@ -27,7 +27,7 @@ METAL_THICKNESS_UM = 0.1     # 1000 angstrom
 AL_RESISTIVITY = 3.243e-8    # ohm*m
 SHEET_RES = AL_RESISTIVITY / (METAL_THICKNESS_UM * 1e-6)   # ohm/square (~0.324)
 COIL_BASE_R = 1000.0          # ohms for the smallest coil in a group
-MAX_BINARY_INPUTS = 6        # split groups bigger than this into separate coupons
+MAX_BINARY_INPUTS = 8        # split groups bigger than this into separate coupons
 
 CALIB_COUNT = 6              # number of calibration resistors (first N ladder steps)
 CALIB_PAD = 1500.0           # calibration probe pad (um), >= 1.5 mm for a multimeter
@@ -40,8 +40,6 @@ WAFER_DIAM_UM = 150000.0     # 6-inch (150 mm) fabrication wafer
 WAFER_EDGE_EXCLUSION_UM = 3000.0  # unusable edge ring (edge bead, handling, non-uniformity)
 WAFER_STREET_UM = MOSAIC_GAP # gap between stepped reticle fields on the wafer
 WAFER_LINE_UM = 500.0        # width of the wafer-edge outline ring
-MARKER_ARM = 500.0           # length of the tile-repeat corner-marker arms (um)
-MARKER_WIDTH = 80.0          # thickness of the tile-repeat marker arms (um)
 
 ADD_LABELS = True
 LABEL_SIZE = 16.8            # pad-text height (um); IO tag + pad name inside each pad
@@ -55,7 +53,6 @@ LABEL_LAYER, LABEL_DT = 101, 0
 IO_LABEL_DT = 1
 BOUNDARY_LAYER, BOUNDARY_DT = 100, 0
 WAFER_LAYER, WAFER_DT = 104, 0   # wafer-edge overlay -- reference only, not fabricated
-MARKER_DT = 2                     # datatype for the tile-repeat corner marker
 
 
 def safe_path(path):
@@ -254,6 +251,22 @@ def inward_along(edge):
 
 
 ROUTE_PITCH = WIRE_WIDTH + WIRE_SPACE   # tooth pitch (traces sit WIRE_SPACE apart)
+
+
+def decode_margin(resistances):
+    """Smallest gap between any two subset sums of the CONDUCTANCES, as a fraction of
+    the all-landed sum -- the fraction of full scale a meter must resolve to tell every
+    landed/open pattern apart. Uses the ACTUAL extracted resistances, not the targets,
+    so it reflects what the routing really built; 0 means two patterns read the same
+    and the coupon cannot be decoded."""
+    g = [1.0 / r for r in resistances if r > 0]
+    if len(g) < 2 or len(g) > 20:
+        return 1.0
+    sums = {0.0}
+    for w in g:
+        sums |= {s + w for s in sums}
+    s = sorted(sums)
+    return min(b - a for a, b in zip(s, s[1:])) / sum(g)
 
 
 def input_target_r(k):
@@ -733,22 +746,38 @@ def square_meander(x_left, top_y, target_len):
     return pts, w, top_y - y
 
 
-def build_calibration(resistances):
-    """One COMMON pad joined through a known meander to each of several big probe pads
-    (metal 1), labelled with theoretical R and trace length. Uses the test-chip die
-    (DIE_W x DIE_H) with content centred, growing only if it wouldn't fit. Returns
-    (library, csv_rows, die_w, die_h)."""
-    L = metal_layer(0)
+def calibration_blocks(resistances):
+    """Per-resistor meander footprints for the calibration coupon: [{R, len, w, h}]."""
     blocks = []
     for R in resistances:
         target = R * WIRE_WIDTH / SHEET_RES
         _, w, h = square_meander(0.0, 0.0, target)
         blocks.append({"R": R, "len": target, "w": w, "h": h})
+    return blocks
+
+
+def calibration_content_size(resistances):
+    """Intrinsic (content) width and height the calibration coupon needs, before any
+    growth to match the test-chip die. Used to keep the coupon and chips one size."""
+    blocks = calibration_blocks(resistances)
+    hmax = max(b["h"] for b in blocks)
+    total_w = sum(max(b["w"], CALIB_PAD) for b in blocks) + CALIB_GAP * (len(blocks) - 1)
+    band_h = 2 * CALIB_PAD + 2 * CALIB_GAP + hmax + 2 * CALIB_LABEL
+    return total_w + 2 * CALIB_GAP, band_h + 2 * CALIB_GAP
+
+
+def build_calibration(resistances):
+    """One COMMON pad joined through a known meander to each of several big probe pads
+    (metal 1), labelled with theoretical R and trace length. Sized to the test-chip die
+    (DIE_W x DIE_H) with content centred -- DIE_W/DIE_H are pre-grown so the coupon and
+    chips match exactly. Returns (library, csv_rows, die_w, die_h)."""
+    L = metal_layer(0)
+    blocks = calibration_blocks(resistances)
     hmax = max(b["h"] for b in blocks)
     col_w = [max(b["w"], CALIB_PAD) for b in blocks]
     total_w = sum(col_w) + CALIB_GAP * (len(blocks) - 1)
     band_h = CALIB_PAD + CALIB_GAP + hmax + CALIB_GAP + CALIB_PAD + 2 * CALIB_LABEL
-    content_w, content_h = total_w + 2 * CALIB_GAP, band_h + 2 * CALIB_GAP
+    content_w, content_h = calibration_content_size(resistances)
     die_w, die_h = max(DIE_W, content_w), max(DIE_H, content_h)
 
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
@@ -866,26 +895,11 @@ def best_field_layout(entries, gap, diam, street, edge_excl):
     return cols, fw, fh, fields
 
 
-def tile_marker(layer, dt):
-    """Right-angle corner bracket framing the field's top-left corner (the repeat
-    origin at (0, 0)). Both arms sit in the surrounding street -- one just above
-    the top edge, one just left of the left edge -- so the marker never overlaps
-    a die. Because it lives in the stepped field, it recurs at the top-left of
-    every tile, showing where the pattern repeats across the wafer."""
-    return [
-        gdstk.rectangle((0.0, 0.0), (MARKER_ARM, MARKER_WIDTH),        # top arm ->
-                        layer=layer, datatype=dt),
-        gdstk.rectangle((-MARKER_WIDTH, -MARKER_ARM), (0.0, 0.0),      # left arm v
-                        layer=layer, datatype=dt),
-    ]
-
-
 def build_mosaic(entries, gap, cols):
     """Tile every (cell, w, h) entry -- each chip plus the calibration coupon --
     into one MOSAIC cell of `cols` columns, so the whole chip-set is a single
     reusable field. Cells keep their own layers/positions; this only adds a top
-    MOSAIC cell with a translated Reference per die, plus a corner marker at the
-    field's top-left showing the repeat origin. Returns (Library, field_w,
+    MOSAIC cell with a translated Reference per die. Returns (Library, field_w,
     field_h); the library holds every referenced cell too, so the GDS is
     self-contained."""
     origins, fw, fh = mosaic_place(entries, gap, cols)
@@ -894,8 +908,6 @@ def build_mosaic(entries, gap, cols):
     top = lib.new_cell("MOSAIC")
     for (c, w, h), origin in zip(entries, origins):
         top.add(gdstk.Reference(c, origin=origin))
-    for poly in tile_marker(WAFER_LAYER, MARKER_DT):
-        top.add(poly)
     return lib, fw, fh
 
 
@@ -1059,9 +1071,10 @@ def ask_layers(default=2):
         print("  Please enter 1 or 2.")
 
 
-def size_and_place(pads, groups):
+def size_and_place(pads, groups, min_die=(0.0, 0.0)):
     """Build each coil at its raw position to measure per-edge protrusion, set the
-    global die size (>= farthest comb + DIE_MARGIN_BUFFER, ring aspect kept), and
+    global die size (>= farthest comb + DIE_MARGIN_BUFFER, ring aspect kept, and
+    >= `min_die` in each dimension so the chips match the calibration coupon), and
     centre the ring. Returns (edge_depth, ring_w, ring_h, scale)."""
     rxs = [p["x"] for p in pads]
     rys = [p["y"] for p in pads]
@@ -1091,6 +1104,7 @@ def size_and_place(pads, groups):
     scale = max(content_w / ring_w, content_h / ring_h)
     global DIE_W, DIE_H
     DIE_W, DIE_H = scale * ring_w, scale * ring_h
+    DIE_W, DIE_H = max(DIE_W, min_die[0]), max(DIE_H, min_die[1])  # match calibration
     margins = {                                 # centre the content in the die
         "left": edge_depth["left"] + buf + (DIE_W - content_w) / 2,
         "right": edge_depth["right"] + buf + (DIE_W - content_w) / 2,
@@ -1197,7 +1211,12 @@ def main():
         coupons.append({"num": SINGLE, "sub": 0, "single": True,
                         "inputs": single_in, "outputs": single_out})
 
-    edge_depth, ring_w, ring_h, scale = size_and_place(pads, coupons)
+    # Uniform die: grow the test chips to at least the calibration coupon's content
+    # (and vice versa, below), so every die -- chips and coupon -- is one size.
+    calib_res = [input_target_r(k) for k in range(1, CALIB_COUNT + 1)]
+    calib_cw, calib_ch = calibration_content_size(calib_res)
+    edge_depth, ring_w, ring_h, scale = size_and_place(pads, coupons,
+                                                       min_die=(calib_cw, calib_ch))
 
     print(f"{len(inputs)} inputs, {len(outputs)} outputs; die {DIE_W:.0f} x {DIE_H:.0f} um ")
     print("Coil protrusion per edge (um): " +
@@ -1205,7 +1224,7 @@ def main():
     print(f"Aluminium {METAL_THICKNESS_UM} um thick, W={WIRE_WIDTH} um -> "
           f"sheet res {SHEET_RES:.3f} ohm/sq; {WIRE_WIDTH/SHEET_RES:.1f} um per ohm.")
     big = max((len(c["inputs"]) for c in coupons if not c.get("single")), default=0)
-    if input_target_r(big) > 1e6 or max(DIE_W, DIE_H) > 5e4:
+    if big and (input_target_r(big) > 1e6 or max(DIE_W, DIE_H) > 5e4):
         print(f"  ! BINARY ladder still needs a {input_target_r(big):,.0f} ohm "
               f"resistor (a {big}-input coupon) and a {DIE_W/1000:.0f} x "
               f"{DIE_H/1000:.0f} mm die -- lower MAX_BINARY_INPUTS.")
@@ -1269,8 +1288,7 @@ def main():
         w.writerows(all_rows)
     # print(f"Wrote {csv_out} ({len(all_rows)} coils across {len(chips)} chips).")
 
-    # Calibration coupon (resistances match the on-chip ladder).
-    calib_res = [input_target_r(k) for k in range(1, CALIB_COUNT + 1)]
+    # Calibration coupon (resistances match the on-chip ladder; die pre-grown to match).
     calib_lib, calib_rows, cdw, cdh = build_calibration(calib_res)
     calib_gds = safe_path(CALIB_DIR / "calibration_resistors.gds")
     calib_lib.write_gds(calib_gds)
@@ -1280,6 +1298,22 @@ def main():
         w.writerow(["target_R_ohm", "actual_R_ohm", "squares", "trace_len_um"])
         w.writerows(calib_rows)
     mosaic_entries.append((calib_lib.cells[0], cdw, cdh))
+
+    # Decode margin, from the resistances actually built (not the ladder targets), so
+    # routing error is included -- check it here, not at the bench.
+    per_coupon = {}
+    for row in all_rows:
+        if row[7] != "continuity":
+            per_coupon.setdefault((row[0], row[1]), []).append(float(row[5]))
+    if per_coupon:
+        worst_k, worst_m = min(((k, decode_margin(v)) for k, v in per_coupon.items()),
+                               key=lambda kv: kv[1])
+        print(f"Decode margin (worst coupon, chip {worst_k[0]} layer {worst_k[1]}): "
+              f"{worst_m*100:.4f}% of full scale.")
+        if worst_m < 0.001:
+            print(f"  ! Margin below 0.1% -- a {1/worst_m:,.0f}:1 measurement is needed "
+                  f"to decode. Lower MAX_BINARY_INPUTS ({MAX_BINARY_INPUTS}) so each "
+                  f"coupon has fewer inputs.")
 
     # Combined mask: every chip plus the calibration coupon tiled into one field,
     # then that field stepped-and-repeated to fill a 6-inch wafer, with the wafer
