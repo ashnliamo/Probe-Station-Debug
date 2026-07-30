@@ -7,8 +7,8 @@ import pathlib
 import gdstk
 
 HERE = pathlib.Path(__file__).parent
-INPUT_DIR = HERE / "io_pair_inputs"
-OUTPUT_DIR = HERE / "io_pair_outputs"
+INPUT_DIR = HERE.parent / "io_pair_inputs"
+OUTPUT_DIR = HERE.parent / "io_pair_outputs"
 GDS_DIR = OUTPUT_DIR / "gds"                # chip mask GDS files
 SCHEMATIC_DIR = OUTPUT_DIR / "schematics"  # per-chip circuit diagrams (SVG)
 CALIB_DIR = OUTPUT_DIR / "calibration"     # calibration coupon GDS + CSV
@@ -21,15 +21,17 @@ VIA_SIZE = 8.0             # via from a 2nd-layer wire up to its top-layer pad
 
 PLANE_RING_MARGIN = 70.0   # keep the shared plane this far inside the ring
 FINGER_OVERLAP = 60.0      # how far each output finger / return reaches into the plane
+PLANE_SPLIT_GAP = 60.0     # isolation gap between the two half-planes when splitting
+SPLIT_HALVES = False       # set in main(): halve each coupon into two 4-resistor sets
 
 # Aluminium-on-Ti resistor: R = SHEET_RES * L / W.
 METAL_THICKNESS_UM = 0.1     # 1000 angstrom
 AL_RESISTIVITY = 3.243e-8    # ohm*m
 SHEET_RES = AL_RESISTIVITY / (METAL_THICKNESS_UM * 1e-6)   # ohm/square (~0.324)
-COIL_BASE_R = 1000.0          # ohms for the smallest coil in a group
+COIL_BASE_R = 4000.0          # ohms for the smallest coil in a group
 MAX_BINARY_INPUTS = 8        # split groups bigger than this into separate coupons
 
-CALIB_COUNT = 6              # number of calibration resistors (first N ladder steps)
+CALIB_COUNT = 4              # number of calibration resistors (first N ladder steps)
 CALIB_PAD = 1500.0           # calibration probe pad (um), >= 1.5 mm for a multimeter
 CALIB_LABEL = 150.0          # calibration label height (um)
 CALIB_GAP = 200.0            # calibration column/pad spacing and margin
@@ -345,51 +347,93 @@ def edge_gaps(e, edge_coords):
     return [(c[i] + c[i + 1]) / 2.0 for i in range(len(c) - 1)]
 
 
-def edge_inputs(group, bounds):
+def edge_inputs(group, bounds, target_of):
     """Same-group inputs bucketed by edge, each sorted by along-coord and tagged
-    (along, target_len, pad); target_len comes from the ladder rank."""
-    ranks = {id(p): k for k, p in enumerate(ordered_inputs(group), 1)}
+    (along, target_len, pad). `target_of` maps id(pad) -> target trace length, so a
+    split coupon's two halves can each run their own ladder."""
     by_edge = {}
     for p in group["inputs"]:
         e = edge_of(p, bounds)
         _, v = inward_along(e)
         a = p["x"] * v[0] + p["y"] * v[1]
-        by_edge.setdefault(e, []).append((a, input_target_len(ranks[id(p)]), p))
+        by_edge.setdefault(e, []).append((a, target_of[id(p)], p))
     for e in by_edge:
         by_edge[e].sort(key=lambda it: it[0])
     return by_edge
 
 
-def solve_bands(items, edge_lo, edge_hi):
+def assign_return_gaps(a, gaps):
+    """One DISTINCT return gap per input, in pad order, each lying strictly between its
+    own pad's neighbouring INPUTS. Without this two combs could claim the slots either
+    side of a third input and leave it none, forcing its return to double back over its
+    own comb. Assignments strictly increase, so the reserved pad-to-gap spans stay
+    ordered and disjoint. Returns [gap or None] aligned with `a`."""
+    n = len(a)
+
+    def window(i):
+        return (a[i - 1] if i else -math.inf,
+                a[i + 1] if i < n - 1 else math.inf)
+
+    def strandable(i, last):
+        """Greedy-smallest for inputs i.. -- if that fails, `last` stranded someone."""
+        for j in range(i, n):
+            lo, hi = window(j)
+            nxt = next((g for g in gaps if g > last and lo < g < hi), None)
+            if nxt is None:
+                return True
+            last = nxt
+        return False
+
+    out, last = [None] * n, -math.inf
+    for i in range(n):
+        lo, hi = window(i)
+        cand = [g for g in gaps if g > last and lo < g < hi]
+        if not cand:
+            continue                                   # caller falls back for this one
+        # Prefer the nearest slot BELOW the pad. Bands are handed out low-to-high, so a
+        # low gap leaves the whole band above the pad free for the fold to grow into --
+        # and taking the low slot in pad order keeps the choices strictly increasing.
+        rank = lambda g: (0 if g < a[i] else 1, abs(g - a[i]))
+        pick = next((g for g in sorted(cand, key=rank)
+                     if not strandable(i + 1, g)), cand[0])
+        out[i], last = pick, pick
+    return out
+
+
+def solve_bands(items, edge_lo, edge_hi, must=None):
     """Partition [edge_lo, edge_hi] into one band per input (pad order), each strictly
-    containing its pad, widths ~proportional to trace length so the comb depth
-    (= len*pitch/width) is levelled across the edge -- making the deepest comb, which
-    sets the die size, as shallow as the pads allow. Disjoint bands that each hold
-    their pad mean combs never touch. Returns [(lo, hi)] aligned with `items`."""
+    containing that input's reserved span `must[i]` -- its pad, and the return gap it
+    has to reach -- with widths ~proportional to trace length so the comb depth
+    (= len*pitch/width) is levelled across the edge. Disjoint bands that each hold
+    their own span mean combs never touch. Returns [(lo, hi)] aligned with `items`."""
     n = len(items)
     a = [it[0] for it in items]
+    req_lo = [must[i][0] if must else a[i] for i in range(n)]
+    req_hi = [must[i][1] if must else a[i] for i in range(n)]
     eps = WIRE_SPACE + WIRE_WIDTH                          # keep neighbouring combs apart
-    edge_lo = min(edge_lo, a[0] - eps)                    # a pad may sit in the corner
-    edge_hi = max(edge_hi, a[-1] + eps)                  #   inset -> still span it
+    edge_lo = min(edge_lo, min(req_lo) - eps)             # a pad may sit in the corner
+    edge_hi = max(edge_hi, max(req_hi) + eps)            #   inset -> still span it
     if n == 1:
         return [(edge_lo, edge_hi)]
     need = [it[1] * ROUTE_PITCH for it in items]          # wire area = width * depth
 
     def cuts_for(depth):
-        """Boundaries giving every comb width >= need/depth and still holding its pad;
+        """Boundaries giving every comb width >= need/depth and still holding its span;
         None if the pad spacing makes it impossible."""
         cuts, prev = [], edge_lo
         for i in range(n - 1):
-            c = min(max(prev + need[i] / depth, a[i] + eps), a[i + 1] - eps)
-            if c - prev < need[i] / depth - 1e-6 or not prev <= a[i] <= c:
+            c = min(max(prev + need[i] / depth, req_hi[i] + eps), req_lo[i + 1] - eps)
+            if (c - prev < need[i] / depth - 1e-6
+                    or not (prev <= req_lo[i] and req_hi[i] <= c)):
                 return None
             cuts.append(c)
             prev = c
-        if edge_hi - prev < need[-1] / depth - 1e-6 or not prev <= a[-1] <= edge_hi:
+        if (edge_hi - prev < need[-1] / depth - 1e-6
+                or not (prev <= req_lo[-1] and req_hi[-1] <= edge_hi)):
             return None
         return cuts
 
-    hi = max(need)                          # surely feasible (~1 um wide combs)
+    hi = max(max(need), 1.0)                # surely feasible (~1 um wide combs)
     while cuts_for(hi) is None and hi < 1e15:
         hi *= 2.0
     lo = 1e-9
@@ -402,6 +446,91 @@ def solve_bands(items, edge_lo, edge_hi):
     cuts = cuts_for(hi) or [(a[i] + a[i + 1]) / 2.0 for i in range(n - 1)]
     edges = [edge_lo] + cuts + [edge_hi]
     return [(edges[i], edges[i + 1]) for i in range(n)]
+
+
+CANOPY_CLEAR = 3.0 * ROUTE_PITCH        # radial gap between the base combs and a canopy
+
+
+def plan_edge(items, edge_lo, edge_hi, gaps):
+    """Plan every input on one edge: a distinct return gap each, then a stack of storeys.
+
+    A comb's depth is its wire area over its band width, and on one storey every band is
+    pinched between the ADJACENT INPUT PADS -- about one pad pitch. That is what makes a
+    64k or 128k resistor tower over the die: it has metres of wire and a 150 um slot.
+
+    So the big ones are lifted onto their own storeys above the rest. The trick is which
+    inputs have to be represented on a given storey: only the one folding there and the
+    ones stacked ABOVE it, which still need a slot to rise through. Everything smaller is
+    already finished below and is simply absent -- so a storey's band is bounded by just
+    a couple of pads and stretches to the ends of the edge, tens of pad pitches wide. The
+    same wire then folds shallow instead of deep. That is the dead space being reclaimed:
+    the empty area outboard of the short combs, up to the die edge the tallest one sets.
+
+    Nothing crosses: an input rises radially at its OWN pad and drops at its OWN gap,
+    both inside the slot reserved for it on every storey it passes through, and folds
+    away from that gap so its own descent never meets its own teeth.
+
+    Costs every split -- the `m` biggest each get a storey, the rest share the base --
+    and keeps the shallowest. Returns [(band, gap, rc)] aligned with `items`; rc is None
+    for a base-storey input, else the radius its fold starts at."""
+    n = len(items)
+    a = [it[0] for it in items]
+    need = [it[1] * ROUTE_PITCH for it in items]
+    gap_of = assign_return_gaps(a, gaps)
+    eps = WIRE_SPACE + WIRE_WIDTH
+    r0 = PAD_SIZE / 2.0 + COIL_GAP
+    req = [(min(a[i], gap_of[i]), max(a[i], gap_of[i])) if gap_of[i] is not None
+           else (a[i], a[i]) for i in range(n)]
+    grow = [1.0 if (gap_of[i] is None or gap_of[i] <= a[i]) else -1.0 for i in range(n)]
+    small_first = sorted(range(n), key=lambda i: need[i])
+
+    best = None
+    for m in range(n + 1):
+        base_set = set(small_first[:n - m])        # the rest share the base storey
+        stacked = small_first[n - m:]              # the m biggest, one storey each
+        # Base storey: every input appears. A stacked input asks for no depth, just the
+        # slot its riser and its drop back down need.
+        base = [(a[i], items[i][1] if i in base_set else 0.0, items[i][2])
+                for i in range(n)]
+        bb = solve_bands(base, edge_lo, edge_hi, req)
+        plan, ok, h = {}, True, 0.0
+        for i in base_set:
+            lo, hi = bb[i]
+            # A base comb ends ON its gap and grows away from it, so only the band on
+            # the far side of the gap is usable -- cost it the way it is actually built.
+            gp = gap_of[i] if gap_of[i] is not None else a[i]
+            w = ((hi - gp) if gp <= a[i] else (gp - lo)) - eps
+            if w <= ROUTE_PITCH:
+                ok = False
+                break
+            h = max(h, need[i] / w)
+            plan[i] = (bb[i], None)
+        if not ok:
+            continue
+        r = r0 + h + (CANOPY_CLEAR if base_set else 0.0)
+        for idx, i in enumerate(stacked):
+            # Only this input and the ones still to be stacked above it are present, and
+            # those only as a slot to rise through -- so the builder takes everything
+            # between its neighbours' slots, out to the ends of the edge.
+            part = sorted(stacked[idx:], key=lambda j: a[j])
+            at = part.index(i)
+            lo = edge_lo if at == 0 else (req[part[at - 1]][1] + req[i][0]) / 2.0
+            hi = edge_hi if at == len(part) - 1 else (req[i][1] + req[part[at + 1]][0]) / 2.0
+            band = (lo, hi)
+            usable = (hi - a[i] if grow[i] > 0 else a[i] - lo) - eps
+            if usable <= ROUTE_PITCH:
+                ok = False
+                break
+            plan[i] = (band, r)
+            r += need[i] / usable + ROUTE_PITCH + CANOPY_CLEAR
+        if ok and (best is None or r < best[0]):
+            best = (r, plan)
+
+    if best is None:                                   # nothing fits; keep it simple
+        bb = solve_bands(items, edge_lo, edge_hi, req)
+        return [(bb[i], gap_of[i], None) for i in range(n)]
+    plan = best[1]
+    return [(plan[i][0], gap_of[i], plan[i][1]) for i in range(n)]
 
 
 def return_through_gap(px, py, far_end, cu, plane):
@@ -477,13 +606,20 @@ def resistive_length(pts, nodes):
     return max(0.0, straight - (1.0 - CORNER_SQUARES) * WIRE_WIDTH * bends)
 
 
-def build_band_coil(pad, e, band, target_len, gaps, bounds, plane):
+def _coil_result(pad, coil, ret, plane):
+    """Actual extracted resistance and total length for a finished coil."""
+    hp = PAD_SIZE / 2.0
+    nodes = [(pad["x"] - hp, pad["y"] - hp, pad["x"] + hp, pad["y"] + hp), plane]
+    r_ohm = SHEET_RES * resistive_length(coil + ret, nodes) / WIRE_WIDTH
+    return r_ohm, polyline_len(coil) + polyline_len(ret)
+
+
+def build_band_coil(pad, e, band, target_len, gap, bounds, plane):
     """Fold one input's resistor into a radial-teeth comb filling its `band` (wide and
     shallow); tooth depth is solved so the trace length = `target_len`. A short lead
-    joins the pad to the comb; the far tooth sits on a pad gap so the return drops
-    inward to the plane. Everything stays in the band, so combs never touch. Returns
-    (coil, return, R_ohm, total_length); R_ohm is the ACTUAL extracted resistance
-    (see resistive_length), which differs from SHEET*total_length/W."""
+    joins the pad to the comb, and the far tooth lands on `gap` -- the slot reserved for
+    this input alone -- so the return drops straight inward to the plane. Everything
+    stays in the band, so combs never touch. Returns (coil, return, R_ohm, length)."""
     lo, hi = band
     u, v = inward_along(e)
     cu = (-u[0], -u[1])                                    # outward, away from the ring
@@ -491,40 +627,18 @@ def build_band_coil(pad, e, band, target_len, gaps, bounds, plane):
     r0 = PAD_SIZE / 2.0 + COIL_GAP
     blo = lo + (WIRE_SPACE + WIRE_WIDTH) / 2.0
     bhi = hi - (WIRE_SPACE + WIRE_WIDTH) / 2.0
-    # Teeth: as many as the band holds, but capped by length so a short resistor stays
-    # compact near its pad instead of being stretched thin (which would overshoot).
-    fit = max(2, int((bhi - blo) / ROUTE_PITCH) // 2 * 2)
+    if gap is None:                        # no slot of its own: sit right beside the pad
+        sd = 1.0 if (bhi - a_pad) >= (a_pad - blo) else -1.0
+        gap = min(max(a_pad + sd * ROUTE_PITCH, blo), bhi)
+    gap = min(max(gap, blo), bhi)
+    s = 1.0 if gap >= a_pad else -1.0                      # comb ends ON the gap
+    # Teeth: as many as the band holds behind the gap, but capped by length so a short
+    # resistor stays compact near its pad instead of being stretched thin.
+    span = (gap - blo) if s > 0 else (bhi - gap)
+    fit = max(2, int(max(span, 0.0) / ROUTE_PITCH) // 2 * 2)
     cap = max(2, int(target_len / (4.0 * ROUTE_PITCH)) // 2 * 2)   # depth >= ~4 pitches
-    in_band = [g for g in gaps if blo <= g <= bhi]
-    # Grow the comb FROM the input pad toward the side with more room, landing its far
-    # tooth on a pad gap (the OUTPUT end, where the return drops to the plane). The gap
-    # must lie PAST the pad, so the whole resistor sits between the input pad and that
-    # output gap -- the comb never doubles back and the short lead can't cross it. Drop
-    # teeth if no reachable gap fits.
-    s_pref = 1.0 if (bhi - a_pad) >= (a_pad - blo) else -1.0
-    m, t0, s, far_gap = min(fit, cap), None, None, None
-    while m >= 2:
-        reach = (m - 1) * ROUTE_PITCH
-        best = None
-        for sdir in (s_pref, -s_pref):                     # prefer the roomier side
-            target = a_pad + sdir * reach                  # ideal far-tooth position
-            for g in in_band:
-                if (g - a_pad) * sdir <= 1e-6:             # gap must lie past the pad
-                    continue
-                cand_t0 = g - sdir * reach                 # so the far tooth sits on g
-                if blo - 1e-6 <= cand_t0 <= bhi + 1e-6 and (
-                        best is None or abs(g - target) < best[0]):
-                    best = (abs(g - target), cand_t0, sdir, g)
-            if best is not None:
-                break
-        if best is not None:
-            _, t0, s, far_gap = best
-            break
-        m -= 2
-    if t0 is None:                                         # no reachable gap in band
-        m, s, reach = 2, s_pref, ROUTE_PITCH
-        t0 = min(max(a_pad, blo + reach), bhi - reach)
-        far_gap = t0 + s * reach
+    m = max(2, min(fit, cap))
+    t0 = min(max(gap - s * (m - 1) * ROUTE_PITCH, blo), bhi)
 
     def build(depth):
         P = lambda t, r: to_xy(e, t, r, bounds)
@@ -542,7 +656,7 @@ def build_band_coil(pad, e, band, target_len, gaps, bounds, plane):
                 if j < m - 1:
                     pts.append(P(t + s * ROUTE_PITCH, r0))
             out = not out
-        ret = return_through_gap(0.0, 0.0, P(far_gap, r0), cu, plane)
+        ret = return_through_gap(0.0, 0.0, P(gap, r0), cu, plane)
         return pts, ret
 
     depth, coil, ret, clen = target_len / m, None, None, 0.0
@@ -550,10 +664,72 @@ def build_band_coil(pad, e, band, target_len, gaps, bounds, plane):
         coil, ret = build(depth)
         clen = polyline_len(coil) + polyline_len(ret)
         depth = max(ROUTE_PITCH, depth + (target_len - clen) / m)
-    hp = PAD_SIZE / 2.0
-    nodes = [(pad["x"] - hp, pad["y"] - hp, pad["x"] + hp, pad["y"] + hp), plane]
-    r_ohm = SHEET_RES * resistive_length(coil + ret, nodes) / WIRE_WIDTH
+    r_ohm, clen = _coil_result(pad, coil, ret, plane)
     return coil, ret, r_ohm, clen
+
+
+def build_canopy_coil(pad, e, band, target_len, gap, rc, bounds, plane):
+    """Fold a big input's resistor in the CANOPY -- a storey starting at radius `rc`,
+    clear of every base comb, whose band is bounded only by the other canopy inputs and
+    so is far wider than the pad-limited band below. Wider band, shallower fold: this is
+    what stops a 64k or 128k resistor from driving the die size.
+
+    The path never crosses anything: it rises radially at its OWN pad (inside its own
+    base band, which carries no comb), folds AWAY from its gap, then runs back over the
+    top of its own teeth and drops down at the gap -- which lies on the empty side of the
+    pad, inside this input's own bands the whole way down. Teeth count is forced odd so
+    the fold finishes at the outer radius and the run back cannot retrace a tooth."""
+    lo, hi = band
+    u, v = inward_along(e)
+    cu = (-u[0], -u[1])
+    a_pad = pad["x"] * v[0] + pad["y"] * v[1]
+    r0 = PAD_SIZE / 2.0 + COIL_GAP
+    blo = lo + (WIRE_SPACE + WIRE_WIDTH) / 2.0
+    bhi = hi - (WIRE_SPACE + WIRE_WIDTH) / 2.0
+    s = 1.0 if (gap is None or gap <= a_pad) else -1.0     # grow away from the gap
+    if gap is None:
+        gap = a_pad - s * ROUTE_PITCH
+    span = (bhi - a_pad) if s > 0 else (a_pad - blo)
+    fit = max(3, int(max(span, 0.0) / ROUTE_PITCH))
+    cap = max(3, int(target_len / (4.0 * ROUTE_PITCH)))
+    m = max(3, min(fit, cap)) // 2 * 2 + 1                 # odd -> ends at the outer edge
+
+    def build(depth):
+        P = lambda t, r: to_xy(e, t, r, bounds)
+        rtop = rc + depth + ROUTE_PITCH
+        pts = [(pad["x"], pad["y"]), P(a_pad, rc)]         # riser, straight up its pad
+        out = True
+        for j in range(m):
+            t = a_pad + s * j * ROUTE_PITCH
+            if out:
+                pts += [P(t, rc), P(t, rc + depth)]
+                if j < m - 1:
+                    pts.append(P(t + s * ROUTE_PITCH, rc + depth))
+            else:
+                pts += [P(t, rc + depth), P(t, rc)]
+                if j < m - 1:
+                    pts.append(P(t + s * ROUTE_PITCH, rc))
+            out = not out
+        t_end = a_pad + s * (m - 1) * ROUTE_PITCH
+        pts += [P(t_end, rtop), P(gap, rtop), P(gap, r0)]  # over the top, down the gap
+        ret = return_through_gap(0.0, 0.0, P(gap, r0), cu, plane)
+        return pts, ret
+
+    depth, coil, ret = max(ROUTE_PITCH, target_len / m), None, None
+    for _ in range(4):                                     # length is linear in depth
+        coil, ret = build(depth)
+        clen = polyline_len(coil) + polyline_len(ret)
+        depth = max(ROUTE_PITCH, depth + (target_len - clen) / (m + 1))
+    r_ohm, clen = _coil_result(pad, coil, ret, plane)
+    return coil, ret, r_ohm, clen
+
+
+def build_input_coil(pad, e, plan, target_len, bounds, plane):
+    """Build one input's resistor from its `plan` -- (band, gap, rc) from plan_edge."""
+    band, gap, rc = plan
+    if rc is None:
+        return build_band_coil(pad, e, band, target_len, gap, bounds, plane)
+    return build_canopy_coil(pad, e, band, target_len, gap, rc, bounds, plane)
 
 
 # ----------------------------------------------------------------------
@@ -584,6 +760,104 @@ def central_plane(bounds):
     minx, maxx, miny, maxy = bounds
     return (minx + PLANE_RING_MARGIN, miny + PLANE_RING_MARGIN,
             maxx - PLANE_RING_MARGIN, maxy - PLANE_RING_MARGIN)
+
+
+MIN_SPLIT_INPUTS = 4       # below this a coupon is already easy to read; don't split
+
+
+def plan_split(group, bounds, all_pads):
+    """Divide a coupon in two, each half getting its own plane, its own share of the
+    OUTPUT pads and its own restarted ladder. Halving the inputs is what buys decode
+    margin: 4 resistors need only 1 part in 15 resolved instead of 1 part in 255, and
+    the top resistor drops from 128k to 8k.
+
+    The cut has to be SPATIAL, because each input returns straight inward and must land
+    on its own half's plane. Pads whose return or finger lands on a plane SIDE pin the
+    divider down, so it is placed in the clear band between the two halves -- never
+    through a pad, which would leave a return stranded in the isolation gap.
+
+    Tries a horizontal and a vertical cut and keeps the better balanced. Returns
+    (axis, divider) or None if no clean cut exists. Output candidates include the
+    OUTPUTSPLIT pads, so the divider is the same in the sizing and drawing passes even
+    though a 2-layer chip only hands half of them to each layer."""
+    # A continuity coupon is already one shorted node; halving it would leave each
+    # input reachable from only half the returns, which its CSV does not express.
+    if group.get("single") or len(group["inputs"]) < MIN_SPLIT_INPUTS:
+        return None
+    ins = group["inputs"]
+    outs = list(group["outputs"]) + [p for p in all_pads if p["io"] == "output"
+                                     and p["group"] == SPLIT_OUT]
+    if not outs:
+        return None
+    minx, maxx, miny, maxy = bounds
+    best = None
+    for axis in ("y", "x"):
+        key = (lambda p: p["y"]) if axis == "y" else (lambda p: p["x"])
+        lo, hi = (miny, maxy) if axis == "y" else (minx, maxx)
+        mid = (lo + hi) / 2.0
+        li = [p for p in ins if key(p) < mid]
+        hi_i = [p for p in ins if key(p) >= mid]
+        if not (li and hi_i):
+            continue
+        # only pads whose return or finger lands on a plane SIDE pin the divider
+        side = ("left", "right") if axis == "y" else ("bottom", "top")
+        on_side = [p for p in ins + outs if edge_of(p, bounds) in side]
+        cl = [key(p) for p in on_side if key(p) < mid]
+        ch = [key(p) for p in on_side if key(p) >= mid]
+        d_lo = (max(cl) + PAD_SIZE) if cl else lo
+        d_hi = (min(ch) - PAD_SIZE) if ch else hi
+        if d_hi - d_lo < PLANE_SPLIT_GAP + 2 * FINGER_OVERLAP:
+            continue                                  # no clear band for the divider
+        div = (d_lo + d_hi) / 2.0
+        if not (any(key(p) < div for p in outs) and any(key(p) >= div for p in outs)):
+            continue                                  # a half would have no output
+        cand = (abs(len(li) - len(hi_i)), -min(len(li), len(hi_i)), axis, div)
+        if best is None or cand[:2] < best[:2]:
+            best = cand
+    return None if best is None else (best[2], best[3])
+
+
+def split_planes(bounds, axis, divider):
+    """The two isolated half-planes either side of `divider`."""
+    px0, py0, px1, py1 = central_plane(bounds)
+    g = PLANE_SPLIT_GAP / 2.0
+    if axis == "y":
+        return (px0, py0, px1, divider - g), (px0, divider + g, px1, py1)
+    return (px0, py0, divider - g, py1), (divider + g, py0, px1, py1)
+
+
+def coupon_planes(group, bounds, all_pads):
+    """Plane geometry for one coupon. Returns (planes, split); split is None when the
+    coupon is drawn whole, else (axis, divider, plane_low, plane_high)."""
+    whole = central_plane(bounds)
+    sp = plan_split(group, bounds, all_pads) if SPLIT_HALVES else None
+    if sp is None:
+        return [whole], None
+    axis, divider = sp
+    pl, ph = split_planes(bounds, axis, divider)
+    return [pl, ph], (axis, divider, pl, ph)
+
+
+def half_of(p, split):
+    """Which half a pad belongs to: (half_id, its plane)."""
+    axis, divider, pl, ph = split
+    v = p["y"] if axis == "y" else p["x"]
+    return (1, pl) if v < divider else (2, ph)
+
+
+def input_targets(group, input_sets=None):
+    """Target trace length per input. Each half RESTARTS the ladder, so a split coupon
+    runs ranks 1..n/2 twice -- that is exactly what shrinks the biggest resistor and
+    widens the decode margin. Split halves rank on their own input centroid, which is
+    known in both the sizing and the drawing pass, so the two agree."""
+    if not input_sets:
+        return {id(p): input_target_len(k)
+                for k, p in enumerate(ordered_inputs(group), 1)}
+    out = {}
+    for ins in input_sets:
+        for k, p in enumerate(ordered_inputs({"inputs": ins, "outputs": []}), 1):
+            out[id(p)] = input_target_len(k)
+    return out
 
 
 def _plane_label(cell, txt, plane, layer_idx):
@@ -621,12 +895,25 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs
         for vp in via_polys(pt, 0):                 # stitch metal L down to top
             add(vp)
 
-    px0, py0, px1, py1 = central_plane(bounds)
-    add(rect(px0, py0, px1, py1, L))                 # the big conductive plane
-    plane = (px0, py0, px1, py1)
+    # One plane, or two isolated half-planes when the coupon is split in two.
+    planes, split = coupon_planes(group, bounds, all_pads)
+    if split is not None:                 # both halves must end up usable on this layer
+        lo_i = [p for p in group["inputs"] if half_of(p, split)[0] == 1]
+        hi_i = [p for p in group["inputs"] if half_of(p, split)[0] == 2]
+        lo_o = [p for p in all_outs if half_of(p, split)[0] == 1]
+        hi_o = [p for p in all_outs if half_of(p, split)[0] == 2]
+        if not all((lo_i, hi_i, lo_o, hi_o)):
+            planes, split = [central_plane(bounds)], None
+    for pp in planes:
+        add(rect(pp[0], pp[1], pp[2], pp[3], L))
+    plane = planes[0]
+    plane_of = ({id(p): half_of(p, split)[1]
+                 for p in list(group["inputs"]) + list(all_outs)} if split
+                else {id(p): plane for p in list(group["inputs"]) + list(all_outs)})
     edge_coords = near_edge_coords(all_pads, bounds)
 
-    def finger(o):                                   # pad-width tab joining o to plane
+    def finger(o):                        # pad-width tab joining o to ITS OWN plane
+        px0, py0, px1, py1 = plane_of.get(id(o), plane)
         e = edge_of(o, bounds)
         cx, cy = o["x"], o["y"]
         if e in ("bottom", "top"):
@@ -648,46 +935,53 @@ def draw_group(group, layer_idx, bounds, cell, chip_idx, all_pads, extra_outputs
             _plane_label(cell, f"Single inputs: {ins}; Return: {rets}", plane, layer_idx)
         for o in group["inputs"] + all_outs:
             finger(o)
-        rows = [[chip_idx, layer_idx + 1, inp["name"], inp["signal"],
+        rows = [[chip_idx, layer_idx + 1, 0, inp["name"], inp["signal"],
                  ";".join(o["name"] for o in all_outs), "0.00", "0",
                  "continuity"] for inp in group["inputs"]]
         return polys, rows
 
-    if ADD_LABELS:                                   # name the coupon on the plane
-        ins = ", ".join(p["name"] for p in ordered_inputs(group))
-        outs = ", ".join(p["name"] for p in all_outs)
-        _plane_label(cell, f"Inputs: {ins}, Outputs: {outs}", plane, layer_idx)
+    # Each half is its own decode unit, so it gets its own label and its own outputs.
+    units = ([(1, lo_i, lo_o, split[2]), (2, hi_i, hi_o, split[3])] if split
+             else [(0, group["inputs"], all_outs, plane)])
+    if ADD_LABELS:
+        for hid, ins, outs, pp in units:
+            tag = f"Half {hid} - " if hid else ""
+            names = ", ".join(p["name"] for p in
+                              ordered_inputs({"inputs": ins, "outputs": outs}))
+            _plane_label(cell, f"{tag}Inputs: {names}, Outputs: "
+                               f"{', '.join(o['name'] for o in outs)}", pp, layer_idx)
 
-    # One disjoint along-edge band per input (width ~ trace length); solved below.
-    band_of, gaps_of = {}, {}
-    for e, items in edge_inputs(group, bounds).items():
-        gaps_of[e] = edge_gaps(e, edge_coords)
+    # Bands are solved per EDGE across the whole coupon, so the two halves' combs stay
+    # disjoint even where both have inputs on the same edge.
+    target_of = input_targets(group, [u[1] for u in units] if split else None)
+    plan_of = {}
+    for e, items in edge_inputs(group, bounds, target_of).items():
         elo, ehi = edge_along_range(e, bounds)
-        for (a, tl, pad), band in zip(items, solve_bands(items, elo, ehi)):
-            band_of[id(pad)] = (e, band)
+        plans = plan_edge(items, elo, ehi, edge_gaps(e, edge_coords))
+        for (a, tl, pad), pl in zip(items, plans):
+            plan_of[id(pad)] = (e, pl)
 
-    rows, r_vals = [], []
-    for k, inp in enumerate(ordered_inputs(group), 1):
-        target_len = input_target_len(k)
-        e, band = band_of[id(inp)]
-        coil, ret, r, clen = build_band_coil(inp, e, band, target_len,
-                                             gaps_of[e], bounds, plane)
-        add(gdstk.FlexPath(coil, WIRE_WIDTH, layer=L, datatype=METAL_DT))
-        add(gdstk.FlexPath(ret, WIRE_WIDTH, layer=L, datatype=METAL_DT))
-        if needs_via:
-            via_at((inp["x"], inp["y"]))
-        r_vals.append(r)
-        rows.append([chip_idx, layer_idx + 1, inp["name"],
-                     inp["signal"], ";".join(o["name"] for o in all_outs),
-                     f"{r:.2f}", f"{clen:.0f}"])
-
-    for o in all_outs:
-        finger(o)
-
-    # Group's all-contacting parallel resistance (every probe landed), on each row.
-    gpar = 1.0 / sum(1.0 / r for r in r_vals) if r_vals else float("inf")
-    for row in rows:
-        row.append(f"{gpar:.3f}")
+    rows = []
+    for hid, ins, outs, pp in units:
+        r_vals, hrows = [], []
+        for inp in ordered_inputs({"inputs": ins, "outputs": outs}):
+            e, pl = plan_of[id(inp)]
+            coil, ret, r, clen = build_input_coil(inp, e, pl, target_of[id(inp)],
+                                                  bounds, pp)
+            add(gdstk.FlexPath(coil, WIRE_WIDTH, layer=L, datatype=METAL_DT))
+            add(gdstk.FlexPath(ret, WIRE_WIDTH, layer=L, datatype=METAL_DT))
+            if needs_via:
+                via_at((inp["x"], inp["y"]))
+            r_vals.append(r)
+            hrows.append([chip_idx, layer_idx + 1, hid, inp["name"], inp["signal"],
+                          ";".join(o["name"] for o in outs), f"{r:.2f}", f"{clen:.0f}"])
+        # all-contacting parallel resistance for THIS half, on each of its rows
+        gpar = 1.0 / sum(1.0 / r for r in r_vals) if r_vals else float("inf")
+        for row in hrows:
+            row.append(f"{gpar:.3f}")
+        rows.extend(hrows)
+        for o in outs:
+            finger(o)
     return polys, rows
 
 
@@ -766,32 +1060,48 @@ def calibration_content_size(resistances):
     return total_w + 2 * CALIB_GAP, band_h + 2 * CALIB_GAP
 
 
+def fit_calib_pad(n, hmax, die_w, die_h):
+    """Largest probe pad that still fits `n` columns on a die_w x die_h coupon. The
+    coupon is sized to the test-chip die, which usually leaves it half empty, so the
+    pads are grown into that room -- a bigger target is easier to land a multimeter
+    probe on by hand. Labels scale with the pad, so they are in the height budget.
+    Never smaller than CALIB_PAD, which is the practical minimum for a probe tip."""
+    lab = CALIB_LABEL / CALIB_PAD                    # label height as a fraction of pad
+    by_w = (die_w - (n + 1) * CALIB_GAP) / n
+    by_h = (die_h - hmax - 4 * CALIB_GAP) / (2.0 + 2.0 * lab)
+    return max(CALIB_PAD, min(by_w, by_h))
+
+
 def build_calibration(resistances):
     """One COMMON pad joined through a known meander to each of several big probe pads
     (metal 1), labelled with theoretical R and trace length. Sized to the test-chip die
     (DIE_W x DIE_H) with content centred -- DIE_W/DIE_H are pre-grown so the coupon and
-    chips match exactly. Returns (library, csv_rows, die_w, die_h)."""
+    chips match exactly -- and the pads then grown to fill whatever room that leaves.
+    Returns (library, csv_rows, die_w, die_h)."""
     L = metal_layer(0)
     blocks = calibration_blocks(resistances)
     hmax = max(b["h"] for b in blocks)
-    col_w = [max(b["w"], CALIB_PAD) for b in blocks]
-    total_w = sum(col_w) + CALIB_GAP * (len(blocks) - 1)
-    band_h = CALIB_PAD + CALIB_GAP + hmax + CALIB_GAP + CALIB_PAD + 2 * CALIB_LABEL
     content_w, content_h = calibration_content_size(resistances)
     die_w, die_h = max(DIE_W, content_w), max(DIE_H, content_h)
+
+    pad = fit_calib_pad(len(blocks), hmax, die_w, die_h)
+    lab = CALIB_LABEL * pad / CALIB_PAD              # keep the text in proportion
+    col_w = [max(b["w"], pad) for b in blocks]
+    total_w = sum(col_w) + CALIB_GAP * (len(blocks) - 1)
+    band_h = pad + CALIB_GAP + hmax + CALIB_GAP + pad + 2 * lab
 
     lib = gdstk.Library(unit=1e-6, precision=1e-9)
     cell = lib.new_cell("CALIB")
     x0 = (die_w - total_w) / 2.0            # centre the column band
     bus_top = -(die_h - band_h) / 2.0
-    bus_bot = bus_top - CALIB_PAD
+    bus_bot = bus_top - pad
     mnd_top = bus_bot - CALIB_GAP
     pad_top = mnd_top - hmax - CALIB_GAP
-    pad_bot = pad_top - CALIB_PAD
+    pad_bot = pad_top - pad
 
     cell.add(rect(x0, bus_bot, x0 + total_w, bus_top, L))   # the common bus pad
     if ADD_LABELS:
-        cell.add(*gdstk.text("COMMON", CALIB_LABEL, (x0 + 20, bus_top + 20),
+        cell.add(*gdstk.text("COMMON", lab, (x0 + 20, bus_top + 20),
                              layer=LABEL_LAYER, datatype=LABEL_DT))
 
     rows, x = [], x0
@@ -810,7 +1120,7 @@ def build_calibration(resistances):
             pts += [(xe, pad_top), (cx, pad_top)]           # L down to the probe pad
             mlen += target - polyline_len(pts)
         cell.add(gdstk.FlexPath(pts, WIRE_WIDTH, layer=L, datatype=METAL_DT))
-        cell.add(rect(cx - CALIB_PAD / 2.0, pad_bot, cx + CALIB_PAD / 2.0, pad_top, L))
+        cell.add(rect(cx - pad / 2.0, pad_bot, cx + pad / 2.0, pad_top, L))
 
         length = polyline_len(pts)                  # physical trace length
         # Accurate resistance: the whole path (bus stub + meander + L to the pad) with
@@ -818,11 +1128,11 @@ def build_calibration(resistances):
         squares = resistive_length(pts, []) / WIRE_WIDTH
         actual_r = SHEET_RES * squares
         if ADD_LABELS:
-            cell.add(*gdstk.text(f"{actual_r:.0f} ohm", CALIB_LABEL,
-                                 (cx - CALIB_PAD / 2.0, pad_bot - CALIB_LABEL - 15),
+            cell.add(*gdstk.text(f"{actual_r:.0f} ohm", lab,
+                                 (cx - pad / 2.0, pad_bot - lab - 15),
                                  layer=LABEL_LAYER, datatype=LABEL_DT))
-            cell.add(*gdstk.text(f"{length:.0f} um", CALIB_LABEL * 0.7,
-                                 (cx - CALIB_PAD / 2.0, pad_bot - 2 * CALIB_LABEL - 30),
+            cell.add(*gdstk.text(f"{length:.0f} um", lab * 0.7,
+                                 (cx - pad / 2.0, pad_bot - 2 * lab - 30),
                                  layer=LABEL_LAYER, datatype=IO_LABEL_DT))
         rows.append([f"{b['R']:.0f}", f"{actual_r:.1f}", f"{squares:.1f}", f"{length:.0f}"])
         x += cw + CALIB_GAP
@@ -950,25 +1260,27 @@ def build_schematic_svg(chip_idx, rows):
     `rows` are that chip's CSV rows; returns the SVG text."""
     by_layer = {}
     for r in rows:
-        by_layer.setdefault(int(r[1]), []).append(r)
+        by_layer.setdefault((int(r[1]), int(r[2])), []).append(r)
 
     x_name, x_term, x_r0, x_r1, x_bus, x_out = 14, 150, 162, 300, 430, 452
     row_h, head_h, foot_h, gap = 46, 40, 60, 30
     width = 640
     body, y = [], 20.0
-    for layer in sorted(by_layer):
-        rs = by_layer[layer]
-        outs = rs[0][4]
-        gpar = rs[0][7]
+    for key in sorted(by_layer):
+        layer, half = key
+        rs = by_layer[key]
+        outs = rs[0][5]
+        gpar = rs[0][8]
         is_single = gpar == "continuity"             # SINGLE coupon: shorts, no ladder
         subtitle = "continuity" if is_single else f"all-parallel {gpar} Ω"
+        name = f"Layer {layer}" + (f" half {half}" if half else "")
         top = y
         body.append(f'<text x="{x_name}" y="{top:.0f}" class="ttl">'
-                    f'Chip {chip_idx} — Layer {layer}  ({subtitle})</text>')
+                    f'Chip {chip_idx} — {name}  ({subtitle})</text>')
         row_y = top + head_h
         ys = [row_y + i * row_h for i in range(len(rs))]
         for (row, ry) in zip(rs, ys):
-            _, _, pad, sig, _, r_ohm, _, _ = row
+            _, _, _, pad, sig, _, r_ohm, _, _ = row
             body.append(f'<rect x="{x_term-9:.0f}" y="{ry-9:.0f}" width="18" '
                         f'height="18" class="pad"/>')
             body.append(f'<text x="{x_name}" y="{ry-2:.0f}" class="lbl">{pad}</text>')
@@ -1035,19 +1347,51 @@ def find_input_csv():
 
 
 def parse_args(argv):
-    """(csv_path, layers). `--layers 1|2` skips the prompt; else layers is None.
-    With no path given, uses whatever single .csv sits in inputs/."""
-    layers, pos = None, []
+    """(csv_path, layers, split). `--layers 1|2` and `--split`/`--no-split` skip their
+    prompts; either is None when not given. With no path, uses the single file in
+    inputs/."""
+    layers, split, pos = None, None, []
     i = 1
     while i < len(argv):
         if argv[i] in ("--layers", "-l") and i + 1 < len(argv):
             layers = argv[i + 1]
             i += 2
+        elif argv[i] == "--split":
+            split, i = True, i + 1
+        elif argv[i] == "--no-split":
+            split, i = False, i + 1
         else:
             pos.append(argv[i])
             i += 1
     csv_path = pathlib.Path(pos[0]) if pos else find_input_csv()
-    return csv_path, (int(layers) if layers in ("1", "2") else None)
+    return csv_path, (int(layers) if layers in ("1", "2") else None), split
+
+
+def ask_split(default=False):
+    """Ask whether to halve each coupon into two independent 4-resistor sets."""
+    if not sys.stdin.isatty():
+        return default
+    prompt = ("\nSplit each coupon into two independent halves?\n"
+              "  n = no  - one set of resistors per layer, one reading\n"
+              "  y = yes - two halves per layer, each with its own plane and half the\n"
+              "            output pads, so each half is read on its own. Halving the\n"
+              "            resistor count per reading widens the decode margin a lot\n"
+              "            and shrinks the biggest resistor.\n"
+              "            Needs the two halves' output pads NOT shorted to each other\n"
+              "            externally, or the halves rejoin off-chip.\n"
+              f"Enter y or n [{'y' if default else 'n'}]: ")
+    while True:
+        try:
+            ans = input(prompt).strip().lower()
+        except EOFError:
+            return default
+        if ans == "":
+            return default
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        print("  Please enter y or n.")
 
 
 def ask_layers(default=2):
@@ -1086,12 +1430,17 @@ def size_and_place(pads, groups, min_die=(0.0, 0.0)):
     for g in groups:
         if g.get("single"):                 # continuity coupon has fingers, no combs
             continue
-        for e, items in edge_inputs(g, raw_bounds).items():
-            gaps = edge_gaps(e, raw_edges)
+        planes, split = coupon_planes(g, raw_bounds, pads)
+        sets = ([[p for p in g["inputs"] if half_of(p, split)[0] == h] for h in (1, 2)]
+                if split else None)
+        target_of = input_targets(g, sets)
+        for e, items in edge_inputs(g, raw_bounds, target_of).items():
             elo, ehi = edge_along_range(e, raw_bounds)
-            for (a, tl, pad), band in zip(items, solve_bands(items, elo, ehi)):
-                coil, _, _, _ = build_band_coil(pad, e, band, tl, gaps,
-                                                raw_bounds, raw_plane)
+            plans = plan_edge(items, elo, ehi, edge_gaps(e, raw_edges))
+            for (a, tl, pad), pl in zip(items, plans):
+                coil, _, _, _ = build_input_coil(
+                    pad, e, pl, tl, raw_bounds,
+                    half_of(pad, split)[1] if split else raw_plane)
                 xs = [p[0] for p in coil]
                 ys = [p[1] for p in coil]
                 prot = {"left": raw_bounds[0] - min(xs), "right": max(xs) - raw_bounds[1],
@@ -1179,9 +1528,13 @@ def build_chip(ci, chip_groups, pads, bounds, split_outs=()):
 
 
 def main():
-    csv_path, layers = parse_args(sys.argv)
+    csv_path, layers, split = parse_args(sys.argv)
     if layers is None:
         layers = ask_layers()
+    if split is None:
+        split = ask_split()
+    global SPLIT_HALVES
+    SPLIT_HALVES = split
     groups_per_chip = layers
     pads = read_pads(csv_path)
     single_in = [p for p in pads if p["io"] == "input" and p["group"] == SINGLE]
@@ -1282,7 +1635,7 @@ def main():
     csv_out = safe_path(OUTPUT_DIR / f"{csv_path.stem}_parallel.csv")
     with open(csv_out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["chip", "layer", "input_pad", "input_signal",
+        w.writerow(["chip", "layer", "half", "input_pad", "input_signal",
                     "output_pads", "actual_R_ohm", "total_len_um",
                     "group_parallel_R_ohm"])
         w.writerows(all_rows)
@@ -1303,8 +1656,8 @@ def main():
     # routing error is included -- check it here, not at the bench.
     per_coupon = {}
     for row in all_rows:
-        if row[7] != "continuity":
-            per_coupon.setdefault((row[0], row[1]), []).append(float(row[5]))
+        if row[8] != "continuity":
+            per_coupon.setdefault((row[0], row[1], row[2]), []).append(float(row[6]))
     if per_coupon:
         worst_k, worst_m = min(((k, decode_margin(v)) for k, v in per_coupon.items()),
                                key=lambda kv: kv[1])

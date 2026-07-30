@@ -3,9 +3,10 @@ import sys
 import pathlib
 
 HERE = pathlib.Path(__file__).parent
-DECODE_DIR = HERE / "decode_inputs"
+DECODE_DIR = HERE.parent / "decode_inputs"
 
 CHIP, LAYER, PAD, R_COL = "chip", "layer", "input_pad", "actual_R_ohm"
+HALF = "half"      # split coupons: each half is its own decode unit; 0 when not split
 MATCH_TOL = 0.05   # accept a subset if its predicted R is within this of measured
 
 
@@ -46,6 +47,14 @@ def load(path):
         if col not in rows[0]:
             raise SystemExit(f"{path} has no '{col}' column.")
     return rows
+
+
+def row_half(r):
+    """This row's half, or 0 for an unsplit coupon or an older CSV with no column."""
+    try:
+        return int((r.get(HALF) or "0").strip() or "0")
+    except ValueError:
+        return 0
 
 
 def ask_choice(prompt, choices):
@@ -260,8 +269,8 @@ def main():
     path = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else find_decode_csv()
     rows = load(path)
     print(f"Loaded {len(rows)} coils from {path}")
-    combos = sorted({(int(r[CHIP]), int(r[LAYER])) for r in rows})
-    print(f"Chips available: {sorted({c for c, _ in combos})}")
+    combos = sorted({(int(r[CHIP]), int(r[LAYER]), row_half(r)) for r in rows})
+    print(f"Chips available: {sorted({c for c, _, _ in combos})}")
 
     rungs = canonical_rungs(rows)
     cal_path = find_calibration_csv()
@@ -284,13 +293,18 @@ def main():
             chip = int(raw)
         except ValueError:
             print("  Enter a whole number."); continue
-        chip_layers = sorted({l for c, l in combos if c == chip})
+        chip_layers = sorted({l for c, l, _ in combos if c == chip})
         if not chip_layers:
-            print(f"  No chip {chip}. Available: {sorted({c for c, _ in combos})}")
+            print(f"  No chip {chip}. Available: {sorted({c for c, _, _ in combos})}")
             continue
         layer = ask_choice(f"Layer # {chip_layers}: ", chip_layers)
+        # A split coupon has two independent halves on this layer -- each is measured
+        # and decoded on its own, between its OWN output pads and the input rail.
+        halves = sorted({h for c, l, h in combos if c == chip and l == layer})
+        half = ask_choice(f"Half # {halves}: ", halves) if halves != [0] else 0
 
-        sel = [r for r in rows if int(r[CHIP]) == chip and int(r[LAYER]) == layer]
+        sel = [r for r in rows if int(r[CHIP]) == chip and int(r[LAYER]) == layer
+               and row_half(r) == half]
         resistors = sorted(((r[PAD], float(r[R_COL])) for r in sel),
                            key=lambda t: t[1])
         if cal:
@@ -301,7 +315,9 @@ def main():
             note = " (calibration-corrected)"
         else:
             note = ""
-        print(f"\nChip {chip}, layer {layer}: {len(resistors)} input resistors{note}")
+        where = f"Chip {chip}, layer {layer}" + (f", half {half}" if half else "")
+        print(f"\n{where}: {len(resistors)} input resistors{note}")
+        print(f"   measure between the input rail and: {sel[0]['output_pads']}")
         for pad, R in resistors:
             print(f"   {pad:>12}  {R:10,.2f} ohm")
 

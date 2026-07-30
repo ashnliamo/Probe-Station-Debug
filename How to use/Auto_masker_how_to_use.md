@@ -114,6 +114,33 @@ It will ask how many metal layers per chip:
 1 = one IO group per chip    -- single metal layer, no vias
 2 = two IO groups per chip   -- second group on metal 2, via-stitched
 
+Then it asks whether to SPLIT each coupon into two independent halves. Answer n to
+keep the old behaviour. Answer y and each layer is built as two separate circuits,
+each with its own plane, its own share of the output pads and its own resistor
+ladder starting again at COIL_BASE_R.
+
+Why you would want that. The decode margin is set by how many resistors share one
+reading. Eight resistors need 1 part in 255 resolved, which is about 0.39 percent,
+and the largest one is 128k. Four resistors need only 1 part in 15, about 6.7
+percent, and the largest is 8k. In practice that is the difference between a
+measurement ruined by probe contact resistance and temperature drift and one that
+simply works. On the example pinout the margin goes from 0.36 percent to 5.87
+percent, and the die gets smaller because the biggest resistor shrinks.
+
+The catch. The two halves are only independent if their OUTPUT pads are not shorted
+to each other outside the chip. If your probe card ties all the return probes into
+one bus, the two planes rejoin off the chip and you are back to reading all eight in
+parallel. Each half needs its own separately routed outputs.
+
+How the split is chosen. The cut is spatial, either horizontal or vertical,
+whichever balances the input count better. It has to be spatial because every input
+returns straight inward and must land on its own half's plane. The divider is placed
+in the clear band between the two halves, never through a pad. If no clean cut
+exists, or a half would end up with no output pad, that coupon is quietly built
+whole as before. A continuity coupon is never split.
+
+You can skip the question with --split or --no-split on the command line.
+
 STEP 1C:  What you get, in outputs/
 
 outputs/
@@ -139,6 +166,8 @@ STEP 1D:  Columns in the key CSV
 
 chip                  which chip and GDS this resistor is on
 layer                 which metal layer, 1 or 2
+half                  1 or 2 on a split coupon, else 0. Each half is measured and
+                      decoded on its own, so the decoder asks which half you read
 input_pad             the input pad name, the probe you are testing
 input_signal          its net name
 output_pads           the shared output pads for the group
@@ -193,6 +222,38 @@ automatically from a CSV:
 
 If no calibration CSV with measured values is present, the decoder instead asks
 you to type each measured value by hand.
+
+STEP 2E:  Beating the noise
+
+WHY THIS MATTERS. The biggest resistors move the reading by very little. On an
+8-resistor coupon the largest one changes the total by only about 0.39 percent -
+under 2 ohm out of about 493 ohm. Two everyday effects are that big or bigger, so
+if you ignore them the top one or two resistors decode at random:
+
+  - PROBE CONTACT RESISTANCE. It sits in series with your reading. About 1 ohm,
+    which is normal, already eats half the margin.
+  - TEMPERATURE. Aluminium changes about 0.39 percent per degree C. A single
+    degree between calibrating and measuring is larger than the whole margin.
+
+WHAT TO DO ABOUT IT. Do the calibration and the measurement in one sitting, on the
+same chuck, without changing the temperature setting. The scale factor you get from
+the calibration die is only valid while the wafer is at the same temperature, so if
+you come back later, or change the chuck temperature, measure the calibration die
+again before trusting a reading.
+
+MEASURE 4-WIRE if your setup allows it. Probe contact resistance is in series with
+the reading, and roughly 1 ohm is enough on its own to make the largest resistor
+decode wrongly. A 4-wire measurement removes it completely.
+
+USE A BENCHTOP METER. You must resolve about 1 part in 255. A 6.5 digit benchtop
+meter, roughly 0.01 percent, does this easily. A handheld meter at 0.5 percent
+cannot, and will decode the largest resistors at random.
+
+THE ROBUST ANSWER IS FEWER RESISTORS PER READING. Answer y to the split question in
+step 1B, or lower MAX_BINARY_INPUTS. Four resistors per reading need only 1 part in
+15 resolved, about 6.7 percent, instead of 1 part in 255. That tolerates roughly 18
+ohm of contact resistance and 8 degrees C of drift, so the noise stops mattering at
+all. With the stacked resistor routing this costs very little die area.
 
 TUNING
 

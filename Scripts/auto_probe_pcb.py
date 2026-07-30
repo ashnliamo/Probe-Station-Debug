@@ -3,8 +3,8 @@ import math
 import pathlib
 
 HERE = pathlib.Path(__file__).parent
-INPUT_DIR = HERE / "auto_probe_pcb_inputs"
-OUTPUT_DIR = HERE / "auto_probe_pcb_outputs"
+INPUT_DIR = HERE.parent / "auto_probe_pcb_inputs"
+OUTPUT_DIR = HERE.parent / "auto_probe_pcb_outputs"
 COL_PAD, COL_SIGNAL, COL_X, COL_Y = ("pad", "signal", "x (um)", "y (um)")
 COL_NETCLASS = "net class"
 UNCLASSIFIED = "UNCLASSIFIED"
